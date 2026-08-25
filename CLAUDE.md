@@ -144,16 +144,43 @@ means no write and only a `last_seen_at` bump, a different one is recorded as a
 change event rather than a silent overwrite. An empty body with no matching
 ETag isn't "unchanged" — it's a failure, and it gets its own outcome.
 
+**Off-host assets get fetched; off-host pages don't.** The host restriction gates
+frontier growth, not fetch count. An `a href` to another host never gets
+enqueued — that's how the crawl stays bounded to the seed's site. `img`,
+`video`/`source`, and `embed` targets get fetched regardless of host, because
+they're leaves: nothing gets parsed out of an image, a video, or a PDF, so
+following one off-host can't grow the frontier. Same restriction, applied to
+what it's actually protecting.
+
+**An unmatched content type is skipped, not failed.** `a href` is type-agnostic
+by design — it discovers the next page and arbitrary direct downloads alike —
+so landing outside the four handlers is routine, not exceptional; a typed
+element can return something its tag didn't promise, same as an extension can
+lie. Either way, once `Content-Type` plus magic bytes settle outside HTML,
+image, video, and PDF, the URL is recorded as `skipped`: no error kind, no
+retry, no body written. `content_type` and `content_length` are kept on the
+row so what was seen is still visible without having downloaded it.
+
+**A field that's legitimately unknowable isn't a failure either.** An SVG can
+be well-formed with no `width`/`height` and no `viewBox` — no intrinsic size
+to read, off the root or anywhere else. When that happens `width` and `height`
+are stored `null` with a reason, `file_size` is stored as usual, and nothing
+about the row says failure. Same shape as video duration when `ffprobe` isn't
+on the `PATH`: the content is real and stored, one field is genuinely absent,
+and that's a fact worth recording, not an error worth retrying.
+
 If you think one of these is wrong, give me the argument before you change
 course.
 
 ## What the database keeps
 
-Frontier and visited state, each URL's status, attempt count and failure
-reason, its next retry time and current lease, content hash and ETag, the
-per-type metadata, and the discovery graph of which page linked to which.
-Enough to stop the crawler, inspect it, and start it again without losing or
-repeating work.
+Frontier and visited state, each URL's status — success, failure, or skipped
+for an unmatched content type — attempt count and failure reason, its next
+retry time and current lease, content hash and ETag, the per-type metadata
+(including a reason when an expected field like SVG dimensions or video
+duration is legitimately absent), and the discovery graph of which page linked
+to which. Enough to stop the crawler, inspect it, and start it again without
+losing or repeating work.
 
 ## How I want to work
 
