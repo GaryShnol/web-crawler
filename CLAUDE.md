@@ -84,8 +84,80 @@ A module gets created when it has work to do, not before.
 
 ## Where things stand
 
-Feature 0 done, no application code yet. Signatures and the schema get written
-in here as steps land.
+Features 1 and 2 are merged into `main`. 3.1 and 3.2 are committed on
+`feature/3-frontier`, not yet merged. Next step is 3.3, the concurrency test.
+`handlers/`, `worker.py`, `engine.py`, `cli.py`, `store/blobs.py` and
+`store/metadata.py` still don't exist.
+
+What's written and merged:
+
+```
+models.py    Outcome, FetchResponse(status_code, headers, body),
+             FetchResult(outcome, elapsed, resolved_url, response),
+             find_header, parse_retry_after, encode_body/decode_body
+errors.py    ErrorKind, Classification,
+             classify(response, prev_etag=None),
+             classify_oversized_body(),
+             classify_exception(TimeoutError | ClientConnectionError | ClientPayloadError)
+url_tools.py normalize(url, base=None), in_scope(url, seed_host, allow_subdomains)
+config.py    Config (pydantic-settings)
+logging.py   json to stdout, bindable context, level from config.log_level
+fetch/       FetchClient(config) as an async context manager, fetch(url, prev_etag=None) -> FetchResult
+             RateLimiter(config, now=monotonic, sleep=asyncio.sleep): acquire(), report(throttled, retry_after)
+             next_attempt(outcome, attempt_no, headers, now, config, jitter=None) -> GiveUp | RetryAt
+tests/fake_api/  the test double, plus test_* for everything above
+```
+
+On `feature/3-frontier`, not yet merged:
+
+```
+migrations/001_init.sql
+             contents(content_hash PK, content_type, byte_size, storage_path,
+                      first_seen_at)
+             urls(id, normalized_url UNIQUE, raw_url, depth, status, attempts,
+                  next_attempt_at, lease_until, content_type, content_length,
+                  content_hash FK->contents, etag, error_kind, error_message,
+                  discovered_at, last_seen_at, updated_at)
+             content_metadata(content_hash PK FK, kind, payload JSONB)
+             links(src_id, dst_id, anchor_text, PK(src_id, dst_id))
+             fetch_attempts(id, url_id, attempt_no, status_code, duration_ms,
+                            error_kind, created_at)
+             partial indexes: (next_attempt_at) WHERE status='pending',
+                              (lease_until)     WHERE status='in_progress'
+store/db.py  create_pool(config), run_migrations(pool, migrations_dir)
+             advisory-lock guarded, applies migrations/*.sql in filename order
+store/frontier.py
+             ClaimedUrl(id, url, attempt_no, etag)
+             DiscoveredLink(raw_url, normalized_url, anchor_text)
+             claim_batch(pool, limit, config) -> list[ClaimedUrl]
+             mark_done(pool, url_id, *, content_type, content_length,
+                       content_hash, etag)
+             mark_failed(pool, url_id, decision: GiveUp | RetryAt, error_kind,
+                         error_message=None)
+             record_attempt(pool, url_id, attempt_no, *, status_code, elapsed,
+                            error_kind=None)
+             release(pool, url_id)
+             recover_expired_leases(pool) -> int
+             enqueue_many(pool, links: list[DiscoveredLink], depth,
+                          src_id=None) -> dict[normalized_url, id]
+```
+
+`attempts` is incremented only by `claim_batch`'s own statement — not by
+`release`, not by `recover_expired_leases`, not by `mark_failed`. Nothing in
+`store/frontier.py` reads `config.max_attempts`; the give-up decision is
+`fetch/retry.py`'s and arrives as an argument. `mark_done` requires a matching
+`contents` row to already exist, so the blob is written before it is called.
+
+Config keys as they stand: `seed_url`, `database_url`, `fetch_api_url`,
+`max_concurrency`, `max_depth`, `requests_per_second`, `max_attempts`,
+`lease_seconds`, `max_body_bytes`, `connect_timeout_seconds`,
+`read_timeout_seconds`, `allow_subdomains`, `rate_limit_min_rps`,
+`rate_limit_decrease_factor`, `rate_limit_recovery_successes`,
+`rate_limit_increase_rps`, `retry_base_seconds`, `retry_max_seconds`,
+`output_dir`, `log_level`. `max_redirects` is gone — see the redirect decision
+in DESIGN.md.
+
+The schema and the rest of the signatures get written in here as steps land.
 
 ## Decisions already made
 
@@ -197,9 +269,14 @@ say `CONTRACT-UPDATE: none`.
 A few smaller things: don't read the spec back to me, don't add a dependency
 without saying what it replaces, and if what I'm asking contradicts something
 above then say so rather than quietly going along with it. If what you're about
-to write runs past ~120 lines, stop and tell me what you'd cut. No TODOs, no
-stub functions, and nothing in the test suite is allowed to actually sleep —
-inject the clock.
+to write runs past ~120 lines, stop and tell me what you'd cut — and if I keep
+it anyway, that's not the rule failing, it's the rule doing its job: `store/`
+modules that are genuinely several single-statement atomic operations (raw SQL,
+no ORM) run bigger than that once docstrings are trimmed to a DESIGN.md
+pointer each; `frontier.py` is 237 lines across six such functions. Say the
+real number and let me decide, rather than reformatting to dodge the count.
+No TODOs, no stub functions, and nothing in the test suite is allowed to
+actually sleep — inject the clock.
 
 ## Commits
 
