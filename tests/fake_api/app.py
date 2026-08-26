@@ -13,6 +13,10 @@ call). A triggered fault overrides the URL's own sequence for that call.
 `create_app`'s optional `capture` list, when given, gets one dict of the
 request headers appended per call — for tests asserting on what a client
 actually sent (e.g. If-None-Match), without standing up a second fake app.
+
+GET /healthz always returns 200 with no side effects -- unlike /fetch, it
+never advances a route's call sequence, so docker-compose's healthcheck
+can poll it without corrupting what a crawl actually sees.
 """
 
 import asyncio
@@ -81,6 +85,10 @@ def create_app(
         calls[url] = n + 1
         return web.json_response(_envelope(sequence[min(n, len(sequence) - 1)]))
 
+    async def healthz(_request: web.Request) -> web.Response:
+        return web.Response(text="ok")
+
     app = web.Application()
     app.router.add_get("/fetch", fetch)
+    app.router.add_get("/healthz", healthz)
     return app

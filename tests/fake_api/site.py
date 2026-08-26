@@ -26,6 +26,13 @@ IMAGE = "http://fixture.local/hero.png"
 PDF = "http://fixture.local/doc.pdf"
 VIDEO = "http://fixture.local/clip.mp4"
 
+# A different body on each of its first three calls, then repeats its
+# last -- app.py's own sequence semantics (call N -> routes[url][min(N,
+# len-1)]). Exists for a revisit to have something to actually see change;
+# nothing here re-triggers a fetch on its own -- that still takes an
+# external nudge back to 'pending', same as test_revisit.py's.
+DRIFTING = "http://fixture.local/drifting"
+
 
 def _html(body: str) -> FakeResponse:
     return FakeResponse(200, {"Content-Type": "text/html"}, body.encode())
@@ -39,7 +46,8 @@ def build_routes() -> dict[str, list[FakeResponse]]:
         f'<img src="{OFFHOST_IMAGE}">'
         f'<a href="{IMAGE}">image</a>'
         f'<a href="{PDF}">pdf</a>'
-        f'<a href="{VIDEO}">video</a></body></html>'
+        f'<a href="{VIDEO}">video</a>'
+        f'<a href="{DRIFTING}">drifting</a></body></html>'
     )
     return {
         SEED: [_html(seed_html)],
@@ -69,4 +77,9 @@ def build_routes() -> dict[str, list[FakeResponse]]:
         IMAGE: [FakeResponse(200, {"Content-Type": "image/png"}, tiny_png())],
         PDF: [FakeResponse(200, {"Content-Type": "application/pdf"}, tiny_pdf())],
         VIDEO: [FakeResponse(200, {"Content-Type": "video/mp4"}, tiny_video_no_duration())],
+        DRIFTING: [
+            _html("<html><body>drifting: version one</body></html>"),
+            _html("<html><body>drifting: version two</body></html>"),
+            _html("<html><body>drifting: version three</body></html>"),
+        ],
     }

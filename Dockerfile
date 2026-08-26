@@ -18,6 +18,31 @@ RUN uv sync --frozen --no-dev
 COPY src/ ./src/
 
 
+# Serves tests/fake_api's fixture site over HTTP -- docker-compose's stand-in
+# for the real fetch service (CLAUDE.md: a test double, not an
+# implementation). --no-dev's venv already covers it: app.py/site.py only
+# import aiohttp, PIL, pypdf and crawler.models, all runtime deps.
+FROM python:3.12-slim AS fake-api
+
+RUN groupadd -g 1000 appuser && useradd -u 1000 -g appuser -m appuser
+
+WORKDIR /app
+COPY --from=builder --chown=appuser:appuser /app/.venv ./.venv
+COPY --from=builder --chown=appuser:appuser /app/src ./src
+COPY --chown=appuser:appuser tests/fake_api ./tests/fake_api
+RUN chown appuser:appuser /app
+
+# /app/tests, not /app: fake_api is imported bare (`import fake_api`, the
+# same way pytest resolves it — tests/ has no __init__.py), not as a
+# submodule of a tests package.
+ENV PATH="/app/.venv/bin:${PATH}" \
+    PYTHONPATH="/app/src:/app/tests"
+
+USER appuser
+
+CMD ["python", "-m", "fake_api"]
+
+
 FROM python:3.12-slim AS crawler
 
 # ffmpeg for ffprobe, used by the video handler to read duration.
