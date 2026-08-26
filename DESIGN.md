@@ -55,3 +55,30 @@ a browsable tree. Hardlinks break across filesystems and misbehave under
 Docker on Windows, where this runs — a mechanism that fails on the required
 platform is a latent bug, not a fallback. Would reconsider given a
 deployment target guaranteed to run on one hardlink-capable filesystem.
+
+## Redirects: resolved_url, not a follow loop
+
+Chose reading `Location` off a `200` straight into `FetchResult.resolved_url`.
+Rejected a follow loop with `max_redirects` and cycle detection. The fetch
+API's status set is closed at `200|404|429|403|500` — no 3xx exists in it —
+so the only shape a redirect can take is a `200` the API already followed on
+our behalf, telling us where it landed. There's nothing left for this client
+to chase, so `max_redirects` came out of config; nothing read it. Would
+reconsider if the API ever returned a 3xx directly.
+
+## Assumption: body crosses the wire as base64
+
+The fetch API's own spec is `body: Buffer | null` — that's the real API's
+contract, not something I can call and inspect. I don't know how it actually
+serializes a `Buffer` into the JSON envelope, so `fetch/client.py` assumes
+base64 text, or `null`. `tests/fake_api` encodes the same way *by calling the
+same function* (`crawler.models.encode_body`, decoded back with
+`decode_body`) rather than each side independently deciding "base64 sounds
+right" — the fixture and the client verifying each other would just be two
+guesses agreeing with themselves.
+
+If the real API turns out to send something else — a plain string, an array
+of ints, hex — the one line that changes is `decode_body` in
+`src/crawler/models.py`. Everything downstream (`classify`, `FetchResponse`,
+the handlers) already only knows `bytes | None`; none of it knows or cares
+how those bytes were spelled on the wire.
