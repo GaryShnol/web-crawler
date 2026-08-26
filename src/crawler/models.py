@@ -8,6 +8,7 @@ class Outcome(enum.Enum):
     """Closed set of fetch outcomes. errors.py maps status codes onto these; nothing else should."""
 
     SUCCESS = "success"
+    NOT_MODIFIED = "not_modified"
     PERMANENT_FAILURE = "permanent_failure"
     TEMPORARY_FAILURE = "temporary_failure"
 
