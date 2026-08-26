@@ -45,9 +45,11 @@ CMD ["python", "-m", "fake_api"]
 
 FROM python:3.12-slim AS crawler
 
-# ffmpeg for ffprobe, used by the video handler to read duration.
+# ffmpeg for ffprobe, used by the video handler to read duration. gosu for
+# docker-entrypoint.sh -- the one place this stage still needs to act as
+# root, however briefly, is fixing up a freshly mounted volume's ownership.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends ffmpeg gosu \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd -g 1000 appuser && useradd -u 1000 -g appuser -m appuser
@@ -56,15 +58,19 @@ WORKDIR /app
 COPY --from=builder --chown=appuser:appuser /app/.venv ./.venv
 COPY --from=builder --chown=appuser:appuser /app/src ./src
 COPY --chown=appuser:appuser migrations/ ./migrations/
-RUN chown appuser:appuser /app
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chown appuser:appuser /app && chmod +x /usr/local/bin/docker-entrypoint.sh
 
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONPATH="/app/src"
 
-USER appuser
-
-# ENTRYPOINT, not CMD: `docker compose run crawler stats` (or `crawl <seed>`)
-# has to append an argument to this, not replace the whole command -- CMD
-# would be replaced wholesale and try to exec a binary literally named
-# "stats".
-ENTRYPOINT ["python", "-m", "crawler.cli"]
+# No USER here -- docker-entrypoint.sh starts as root (needed to chown a
+# freshly mounted volume, which a build-time chown can never reach: the
+# mount happens at container start, after the image's own chown, and
+# always wins) and gosu drops to appuser before exec'ing the real process.
+#
+# ENTRYPOINT, not CMD: `docker compose run crawler stats` (or `crawl
+# <seed>`) has to append an argument to this, not replace the whole
+# command -- CMD would be replaced wholesale and try to exec a binary
+# literally named "stats".
+ENTRYPOINT ["docker-entrypoint.sh"]
