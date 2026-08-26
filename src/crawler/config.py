@@ -10,6 +10,7 @@ class Config(BaseSettings):
 
     seed_url: str
     database_url: str
+    fetch_api_url: str
 
     max_concurrency: int = 8
     max_depth: int | None = None
@@ -17,7 +18,16 @@ class Config(BaseSettings):
     max_attempts: int = 5
     lease_seconds: int = 120
     max_body_bytes: int = 52_428_800
-    max_redirects: int = 5
+    connect_timeout_seconds: float = 5.0
+    read_timeout_seconds: float = 30.0
     allow_subdomains: bool = False
+
+    rate_limit_min_rps: float = 0.5
+    rate_limit_decrease_factor: float = 0.5
+    rate_limit_recovery_successes: int = 10
+    rate_limit_increase_rps: float = 0.5
+
+    retry_base_seconds: float = 1.0
+    retry_max_seconds: float = 60.0
     output_dir: Path = Path("output")
     log_level: str = "INFO"
