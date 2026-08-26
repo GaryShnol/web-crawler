@@ -21,7 +21,7 @@ from .config import Config
 from .errors import ErrorKind
 from .fetch.client import FetchClient
 from .fetch.rate_limiter import RateLimiter
-from .fetch.retry import next_attempt
+from .fetch.retry import GiveUp, next_attempt
 from .handlers import base as handlers
 from .logging import bind
 from .models import FetchResult, Outcome, find_header, parse_retry_after
@@ -116,7 +116,8 @@ async def _persist_failure(
     )
     async with pool.acquire() as conn, conn.transaction():
         await frontier.mark_failed(conn, claimed.id, claimed.lease_token, decision, result.error_kind)
-    logger.info(f"failed: {result.error_kind.value}")
+    verb = "failed" if isinstance(decision, GiveUp) else "retrying"
+    logger.info(f"{verb}: {result.error_kind.value}")
 
 
 async def process_one(
