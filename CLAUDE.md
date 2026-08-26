@@ -84,9 +84,10 @@ A module gets created when it has work to do, not before.
 
 ## Where things stand
 
-Features 1 and 2 are merged into `main`. Next step is 3.1, the schema — nothing
-under `store/` exists yet, and neither do `handlers/`, `worker.py`, `engine.py`
-or `cli.py`.
+Features 1 and 2 are merged into `main`. 3.1 and 3.2 are committed on
+`feature/3-frontier`, not yet merged. Next step is 3.3, the concurrency test.
+`handlers/`, `worker.py`, `engine.py`, `cli.py`, `store/blobs.py` and
+`store/metadata.py` still don't exist.
 
 What's written and merged:
 
@@ -106,6 +107,46 @@ fetch/       FetchClient(config) as an async context manager, fetch(url, prev_et
              next_attempt(outcome, attempt_no, headers, now, config, jitter=None) -> GiveUp | RetryAt
 tests/fake_api/  the test double, plus test_* for everything above
 ```
+
+On `feature/3-frontier`, not yet merged:
+
+```
+migrations/001_init.sql
+             contents(content_hash PK, content_type, byte_size, storage_path,
+                      first_seen_at)
+             urls(id, normalized_url UNIQUE, raw_url, depth, status, attempts,
+                  next_attempt_at, lease_until, content_type, content_length,
+                  content_hash FK->contents, etag, error_kind, error_message,
+                  discovered_at, last_seen_at, updated_at)
+             content_metadata(content_hash PK FK, kind, payload JSONB)
+             links(src_id, dst_id, anchor_text, PK(src_id, dst_id))
+             fetch_attempts(id, url_id, attempt_no, status_code, duration_ms,
+                            error_kind, created_at)
+             partial indexes: (next_attempt_at) WHERE status='pending',
+                              (lease_until)     WHERE status='in_progress'
+store/db.py  create_pool(config), run_migrations(pool, migrations_dir)
+             advisory-lock guarded, applies migrations/*.sql in filename order
+store/frontier.py
+             ClaimedUrl(id, url, attempt_no, etag)
+             DiscoveredLink(raw_url, normalized_url, anchor_text)
+             claim_batch(pool, limit, config) -> list[ClaimedUrl]
+             mark_done(pool, url_id, *, content_type, content_length,
+                       content_hash, etag)
+             mark_failed(pool, url_id, decision: GiveUp | RetryAt, error_kind,
+                         error_message=None)
+             record_attempt(pool, url_id, attempt_no, *, status_code, elapsed,
+                            error_kind=None)
+             release(pool, url_id)
+             recover_expired_leases(pool) -> int
+             enqueue_many(pool, links: list[DiscoveredLink], depth,
+                          src_id=None) -> dict[normalized_url, id]
+```
+
+`attempts` is incremented only by `claim_batch`'s own statement — not by
+`release`, not by `recover_expired_leases`, not by `mark_failed`. Nothing in
+`store/frontier.py` reads `config.max_attempts`; the give-up decision is
+`fetch/retry.py`'s and arrives as an argument. `mark_done` requires a matching
+`contents` row to already exist, so the blob is written before it is called.
 
 Config keys as they stand: `seed_url`, `database_url`, `fetch_api_url`,
 `max_concurrency`, `max_depth`, `requests_per_second`, `max_attempts`,
