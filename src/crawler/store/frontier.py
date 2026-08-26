@@ -164,26 +164,38 @@ async def mark_done(
     content_length: int | None,
     content_hash: str | None,
     etag: str | None,
-) -> None:
-    """Records what landed. `content_changed_at` moves to now() exactly
-    when this row already had a real `content_hash` and the new one
-    differs from it — a url's first successful fetch, or a revisit whose
-    hash matches, both leave it alone. The comparison reads `content_hash`
-    unqualified on the right-hand side of SET, which Postgres evaluates
-    against the row as it stood before this statement, not against $5 —
-    so the previous hash never has to be read separately and passed in.
+) -> str | None:
+    """Records what landed, and returns the row's own `content_hash` from
+    immediately before this write — `None` on a url's first successful
+    fetch, the prior hash on a revisit. The caller uses that to tell a
+    first fetch from a revisit, and (comparing it to `content_hash`) an
+    unchanged revisit from a changed one, entirely from this return value
+    — no second query.
+
+    `content_changed_at` moves to now() in the same statement, exactly
+    when that prior hash is non-null and differs from the new one. A CTE
+    reads the pre-update row once; the UPDATE's own SET could compare
+    against it unqualified without one (Postgres evaluates SET against the
+    pre-update row), but RETURNING only ever sees the row after — so
+    getting the prior hash *out* needs the CTE regardless.
     """
-    result = await conn.execute(
+    row = await conn.fetchrow(
         """
+        WITH prior AS (
+            SELECT content_hash FROM urls WHERE id = $1 AND lease_token = $2
+        )
         UPDATE urls
         SET status = 'done', content_type = $3, content_length = $4,
             content_hash = $5, etag = $6,
             content_changed_at = CASE
-                WHEN content_hash IS NOT NULL AND content_hash IS DISTINCT FROM $5 THEN now()
-                ELSE content_changed_at
+                WHEN prior.content_hash IS NOT NULL AND prior.content_hash IS DISTINCT FROM $5
+                    THEN now()
+                ELSE urls.content_changed_at
             END,
             lease_until = NULL, last_seen_at = now(), updated_at = now()
-        WHERE id = $1 AND lease_token = $2
+        FROM prior
+        WHERE urls.id = $1 AND urls.lease_token = $2
+        RETURNING prior.content_hash AS previous_hash
         """,
         url_id,
         lease_token,
@@ -192,7 +204,10 @@ async def mark_done(
         content_hash,
         etag,
     )
-    _warn_if_lost_race(result, url_id, "mark_done")
+    if row is None:
+        logger.warning(f"mark_done: lease race lost, no row updated (url_id={url_id})")
+        return None
+    return row["previous_hash"]
 
 
 async def mark_unchanged(conn: asyncpg.Connection, url_id: int, lease_token: uuid.UUID) -> None:
