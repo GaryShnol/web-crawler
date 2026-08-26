@@ -1,0 +1,2 @@
+I spent a session up front deciding how to work rather than what to build — one step per session, a CLAUDE.md that carries state between them, and each session handing back what changed in the contract. No code came out of it, so it's not in the transcripts. What it settled on is the method above.
+contract-update please - aiohttp, pytest-asyncio, log_level and the config keys
