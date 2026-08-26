@@ -40,6 +40,7 @@ class ClaimedUrl:
     depth: int
     attempt_no: int
     etag: str | None
+    content_hash: str | None
     lease_token: uuid.UUID
 
 
@@ -101,7 +102,7 @@ async def claim_batch(conn: asyncpg.Connection, limit: int, config: Config) -> l
             FOR UPDATE SKIP LOCKED
             LIMIT $1
         )
-        RETURNING id, normalized_url, depth, attempts, etag, lease_token
+        RETURNING id, normalized_url, depth, attempts, etag, content_hash, lease_token
         """,
         limit,
         config.lease_seconds,
@@ -113,6 +114,7 @@ async def claim_batch(conn: asyncpg.Connection, limit: int, config: Config) -> l
             depth=r["depth"],
             attempt_no=r["attempts"],
             etag=r["etag"],
+            content_hash=r["content_hash"],
             lease_token=r["lease_token"],
         )
         for r in rows
@@ -164,16 +166,27 @@ async def mark_done(
     content_length: int | None,
     content_hash: str | None,
     etag: str | None,
+    previous_hash: str | None,
 ) -> None:
-    """Records what landed. Whether `content_hash` matches a prior visit is
-    the caller's comparison to make first; this only writes the result.
+    """Records what landed. `previous_hash` is the row's `content_hash`
+    before this write — `claim_batch` reads it off the row at claim time —
+    so this can tell a url's first successful fetch (`previous_hash` is
+    `None`) from a revisit whose body actually changed (`previous_hash` set
+    and different from `content_hash`) from a revisit that didn't (equal).
+    Only the last of those three leaves `content_changed_at` where it was;
+    only the middle one moves it to now(). Neither this function nor the
+    caller compares byte-for-byte — the hash is the comparison.
     """
     result = await conn.execute(
         """
         UPDATE urls
         SET status = 'done', content_type = $3, content_length = $4,
-            content_hash = $5, etag = $6, lease_until = NULL,
-            last_seen_at = now(), updated_at = now()
+            content_hash = $5, etag = $6,
+            content_changed_at = CASE
+                WHEN $7::text IS NOT NULL AND $7 IS DISTINCT FROM $5 THEN now()
+                ELSE content_changed_at
+            END,
+            lease_until = NULL, last_seen_at = now(), updated_at = now()
         WHERE id = $1 AND lease_token = $2
         """,
         url_id,
@@ -182,6 +195,7 @@ async def mark_done(
         content_length,
         content_hash,
         etag,
+        previous_hash,
     )
     _warn_if_lost_race(result, url_id, "mark_done")
 

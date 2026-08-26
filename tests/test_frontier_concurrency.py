@@ -46,6 +46,7 @@ async def _mark_done(pool, url_id: int, lease_token) -> None:
             content_length=None,
             content_hash=None,
             etag=None,
+            previous_hash=None,
         )
 
 

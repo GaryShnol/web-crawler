@@ -102,6 +102,7 @@ async def _persist_success(
             content_length=len(response.body),
             content_hash=content_hash,
             etag=find_header(response.headers, "ETag"),
+            previous_hash=claimed.content_hash,
         )
     logger.info("done", extra={"context": {"kind": handler.kind, "links": len(in_scope_links)}})
 
