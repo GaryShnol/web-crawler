@@ -89,6 +89,7 @@ class FetchClient:
                 elapsed=time.monotonic() - started,
                 resolved_url=None,
                 response=None,
+                error_kind=classification.error_kind,
             )
 
         elapsed = time.monotonic() - started
@@ -96,7 +97,11 @@ class FetchClient:
         if raw is None:
             classification = classify_oversized_body()
             return FetchResult(
-                outcome=classification.outcome, elapsed=elapsed, resolved_url=None, response=None
+                outcome=classification.outcome,
+                elapsed=elapsed,
+                resolved_url=None,
+                response=None,
+                error_kind=classification.error_kind,
             )
 
         envelope = json.loads(raw)
@@ -112,4 +117,5 @@ class FetchClient:
             elapsed=elapsed,
             resolved_url=find_header(response.headers, "Location"),
             response=response,
+            error_kind=classification.error_kind,
         )

@@ -14,7 +14,11 @@ _context: contextvars.ContextVar[dict[str, object] | None] = contextvars.Context
 
 class _ContextFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        record.context = _context.get() or {}
+        # Merge, not overwrite: a call site's own `extra={"context": {...}}`
+        # (record-specific detail) is set before this filter runs, and has
+        # to survive it — bound context (bind()'s bind, ambient for the
+        # whole span) goes in first, so a same-named call-site field wins.
+        record.context = {**(_context.get() or {}), **getattr(record, "context", {})}
         return True
 
 

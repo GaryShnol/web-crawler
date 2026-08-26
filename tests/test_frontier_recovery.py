@@ -29,7 +29,8 @@ class TestRecoverExpiredLeases:
         url_id = row["id"]
         config = _config()
 
-        [claimed] = await claim_batch(pool, 1, config)
+        async with pool.acquire() as conn:
+            [claimed] = await claim_batch(conn, 1, config)
         assert claimed.id == url_id
         assert claimed.attempt_no == 1
 
@@ -41,7 +42,8 @@ class TestRecoverExpiredLeases:
             url_id,
         )
 
-        recovered = await recover_expired_leases(pool)
+        async with pool.acquire() as conn:
+            recovered = await recover_expired_leases(conn)
         assert recovered == 1
 
         attempts_after_recovery = await pool.fetchval(
@@ -49,6 +51,7 @@ class TestRecoverExpiredLeases:
         )
         assert attempts_after_recovery == 1  # recovery itself never touches attempts
 
-        [reclaimed] = await claim_batch(pool, 1, config)
+        async with pool.acquire() as conn:
+            [reclaimed] = await claim_batch(conn, 1, config)
         assert reclaimed.id == url_id
         assert reclaimed.attempt_no == 2  # bumped once, by this claim — not by recovery
