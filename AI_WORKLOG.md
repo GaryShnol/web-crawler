@@ -44,6 +44,25 @@ rather than output I accepted.
 4. **`max_attempts` inside the frontier.** The give-up decision is
    `fetch/retry.py`'s; `mark_failed` takes it as an argument and writes it.
 
+5. **Terminal writes matched on `id` alone.** `claim_batch` returned no owner,
+   so a worker whose lease expired and was reclaimed mid-fetch would still
+   write `done` over the row's new owner — at-most-once broken by the recovery
+   path that exists to preserve it. `claim_batch` now mints a `lease_token` per
+   claim, and every write that could land on a row the caller no longer owns
+   checks it; zero rows matched is a lost race, logged, not raised.
+
+6. **Structured log context flattened into an f-string.** `_ContextFilter`
+   overwrote `record.context` instead of merging, so a call site's own
+   `extra={"context": ...}` never reached stdout. The fix offered interpolated
+   those fields into the message text, which makes them unqueryable. The filter
+   merges now; the call sites stayed structured.
+
+7. **`Pool | Connection` as a parameter type.** Both satisfy `.execute`, which
+   is why it typechecks and why it is the wrong type: it hides whether a write
+   is the claim's own short transaction or part of the caller's longer one.
+   `store/frontier.py` takes a `Connection`; the pool stays at `engine.py` and
+   `cli.py`.
+
 ## Where I was wrong
 
 I challenged the claim that `INSERT ... ON CONFLICT DO NOTHING` raises a

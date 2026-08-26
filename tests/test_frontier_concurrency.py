@@ -1,12 +1,22 @@
 """claim_batch and enqueue_many under real contention. A mocked pool can't
 reproduce the row-locking behaviour DESIGN.md relies on, so these run
 against a live database — see conftest.py's pool fixture.
+
+frontier.py takes a connection, never the pool (store/frontier.py's own
+docstring on why) — each concurrent call below acquires its own, the way
+worker.py's per-url pipeline would.
 """
 
 import asyncio
 
 from crawler.config import Config
-from crawler.store.frontier import DiscoveredLink, claim_batch, enqueue_many, mark_done
+from crawler.store.frontier import (
+    DiscoveredLink,
+    claim_batch,
+    enqueue_many,
+    mark_done,
+    recover_expired_leases,
+)
 
 NUM_URLS = 500
 NUM_CLAIMERS = 12
@@ -19,6 +29,29 @@ def _config() -> Config:
         database_url="postgresql://unused/unused",
         fetch_api_url="http://unused/unused",
     )
+
+
+async def _claim(pool, limit: int, config: Config):
+    async with pool.acquire() as conn:
+        return await claim_batch(conn, limit, config)
+
+
+async def _mark_done(pool, url_id: int, lease_token) -> None:
+    async with pool.acquire() as conn:
+        await mark_done(
+            conn,
+            url_id,
+            lease_token,
+            content_type=None,
+            content_length=None,
+            content_hash=None,
+            etag=None,
+        )
+
+
+async def _enqueue(pool, links: list[DiscoveredLink], depth: int, src_id: int | None = None):
+    async with pool.acquire() as conn:
+        return await enqueue_many(conn, links, depth, src_id)
 
 
 async def _insert_url(pool, normalized_url: str) -> int:
@@ -49,19 +82,47 @@ async def _claim_until_drained(pool, config: Config) -> list[int]:
     """
     claimed: list[int] = []
     while True:
-        batch = await claim_batch(pool, BATCH_LIMIT, config)
+        batch = await _claim(pool, BATCH_LIMIT, config)
         if not batch:
             return claimed
         for claimed_url in batch:
-            await mark_done(
-                pool,
-                claimed_url.id,
-                content_type=None,
-                content_length=None,
-                content_hash=None,
-                etag=None,
-            )
+            await _mark_done(pool, claimed_url.id, claimed_url.lease_token)
             claimed.append(claimed_url.id)
+
+
+class TestLeaseTokenFencing:
+    async def test_reclaimed_row_rejects_the_original_claimer_s_terminal_write(self, pool):
+        """The race lease_token exists for: a lease expires and is
+        recovered while the original claimer is still mid-flight, unaware.
+        Its eventual mark_done must not land on the row a second claimer
+        has since taken — id alone can't tell the two apart, only the
+        token minted at claim time can.
+        """
+        url_id = await _insert_url(pool, "http://fixture.local/contested")
+        config = _config()
+
+        [first] = await _claim(pool, 1, config)
+        assert first.id == url_id
+
+        # Stand-in for the first claimer's lease going stale — same
+        # backdating trick as test_frontier_recovery.py.
+        await pool.execute(
+            "UPDATE urls SET lease_until = now() - interval '1 second' WHERE id = $1", url_id
+        )
+        async with pool.acquire() as conn:
+            recovered = await recover_expired_leases(conn)
+        assert recovered == 1
+
+        [second] = await _claim(pool, 1, config)
+        assert second.id == url_id
+        assert second.lease_token != first.lease_token
+
+        # The stale claimer, still in flight, finally tries to finish.
+        await _mark_done(pool, url_id, first.lease_token)
+
+        row = await pool.fetchrow("SELECT status, lease_token FROM urls WHERE id = $1", url_id)
+        assert row["status"] == "in_progress"  # untouched — still the second claimer's
+        assert row["lease_token"] == second.lease_token
 
 
 class TestClaimBatchConcurrency:
@@ -91,17 +152,16 @@ class TestEnqueueManyIdempotency:
         # ON CONFLICT DO NOTHING, so if this were left at the default
         # 'pending' a regression that overwrites status to 'pending'
         # would pass unnoticed — it was already 'pending'.
-        await mark_done(
-            pool, target_id, content_type=None, content_length=None, content_hash=None, etag=None
-        )
+        [claimed_target] = await _claim(pool, 1, _config())
+        await _mark_done(pool, target_id, claimed_target.lease_token)
 
         parent_a = await _insert_url(pool, "http://fixture.local/parent-a")
         parent_b = await _insert_url(pool, "http://fixture.local/parent-b")
         link = DiscoveredLink(raw_url=target_url, normalized_url=target_url, anchor_text=None)
 
         await asyncio.gather(
-            enqueue_many(pool, [link], depth=1, src_id=parent_a),
-            enqueue_many(pool, [link], depth=1, src_id=parent_b),
+            _enqueue(pool, [link], depth=1, src_id=parent_a),
+            _enqueue(pool, [link], depth=1, src_id=parent_b),
         )
 
         rows = await pool.fetch("SELECT id, status FROM urls WHERE normalized_url = $1", target_url)
@@ -127,8 +187,8 @@ class TestEnqueueManyIdempotency:
         link = DiscoveredLink(raw_url=target_url, normalized_url=target_url, anchor_text=None)
 
         result_a, result_b = await asyncio.gather(
-            enqueue_many(pool, [link], depth=1, src_id=parent_a),
-            enqueue_many(pool, [link], depth=1, src_id=parent_b),
+            _enqueue(pool, [link], depth=1, src_id=parent_a),
+            _enqueue(pool, [link], depth=1, src_id=parent_b),
         )
 
         assert target_url in result_a

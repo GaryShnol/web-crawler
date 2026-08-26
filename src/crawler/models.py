@@ -5,6 +5,10 @@ import enum
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .errors import ErrorKind  # errors.py imports models.py; this side stays type-only
 
 
 class Outcome(enum.Enum):
@@ -98,9 +102,16 @@ class FetchResult:
     No `attempt` here — the client doesn't know which attempt this is, the
     worker does, off the row it claimed. A field only the caller can fill in
     correctly doesn't belong on the callee's return type.
+
+    `error_kind` is `errors.classify*`'s own verdict, carried through rather
+    than dropped: fetch/client.py already computes it to decide `outcome`,
+    and it's the one thing a caller recording a failure (store/frontier.py's
+    mark_failed, which requires it) can't safely re-derive — a `response`-less
+    result (timeout, oversized body) has nothing left to reclassify from.
     """
 
     outcome: Outcome
     elapsed: float
     resolved_url: str | None
     response: FetchResponse | None
+    error_kind: "ErrorKind | None" = None

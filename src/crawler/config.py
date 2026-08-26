@@ -22,6 +22,12 @@ class Config(BaseSettings):
     read_timeout_seconds: float = 30.0
     allow_subdomains: bool = False
 
+    # None means "half of lease_seconds" — a fixed literal default would
+    # silently drift out of sync with a lease_seconds override.
+    lease_recovery_interval_seconds: float | None = None
+    poll_interval_seconds: float = 1.0
+    shutdown_grace_seconds: float = 30.0
+
     rate_limit_min_rps: float = 0.5
     rate_limit_decrease_factor: float = 0.5
     rate_limit_recovery_successes: int = 10
