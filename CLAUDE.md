@@ -228,9 +228,14 @@ say `CONTRACT-UPDATE: none`.
 A few smaller things: don't read the spec back to me, don't add a dependency
 without saying what it replaces, and if what I'm asking contradicts something
 above then say so rather than quietly going along with it. If what you're about
-to write runs past ~120 lines, stop and tell me what you'd cut. No TODOs, no
-stub functions, and nothing in the test suite is allowed to actually sleep —
-inject the clock.
+to write runs past ~120 lines, stop and tell me what you'd cut — and if I keep
+it anyway, that's not the rule failing, it's the rule doing its job: `store/`
+modules that are genuinely several single-statement atomic operations (raw SQL,
+no ORM) run bigger than that once docstrings are trimmed to a DESIGN.md
+pointer each; `frontier.py` is 237 lines across six such functions. Say the
+real number and let me decide, rather than reformatting to dodge the count.
+No TODOs, no stub functions, and nothing in the test suite is allowed to
+actually sleep — inject the clock.
 
 ## Commits
 

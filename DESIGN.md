@@ -82,3 +82,87 @@ of ints, hex — the one line that changes is `decode_body` in
 `src/crawler/models.py`. Everything downstream (`classify`, `FetchResponse`,
 the handlers) already only knows `bytes | None`; none of it knows or cares
 how those bytes were spelled on the wire.
+
+## Lease recovery: a separate sweep, not folded into claim_batch
+
+Chose a periodic `recover_expired_leases` statement. Rejected folding an
+expired lease into `claim_batch`'s own `WHERE` as a second, `OR`'d-in
+branch (`status = 'in_progress' AND lease_until < now()`) — tried that
+first, and it's wrong under load. With 50k `done` rows and 2k `pending`,
+`EXPLAIN (ANALYZE, BUFFERS)` on the `OR` version shows `BitmapOr` across
+both partial indexes, feeding a `Bitmap Heap Scan` that materializes all
+2000 eligible rows, then a `Sort` on `next_attempt_at` over that whole set,
+*then* `LIMIT`. Dropping the `OR` back to `status = 'pending'` alone
+changes the plan to `Index Scan using urls_pending_idx`, ordered, reading
+only enough rows to satisfy `LIMIT` (confirmed: 3 buffers touched instead
+of 66, in `EXPLAIN`'s own numbers). A `BitmapOr` result has no order
+Postgres can rely on, so `ORDER BY` can't be pushed into the scan the way
+it can for a single-condition `WHERE` — the cost stops scaling with
+`LIMIT` and starts scaling with how many rows are eligible, which is
+exactly backwards as `pending` count grows. `recover_expired_leases`
+doesn't touch `attempts`, same as `release` — only `claim_batch`'s own
+`UPDATE` ever increments it, so a lease reclaimed after a crash still
+costs exactly one attempt on its next claim, regardless of which of
+`release` / a retry decision / this sweep put the row back in `pending`.
+Would reconsider if `claim_batch`'s `pending`-only plan ever stops being
+an ordered index scan on its own (e.g. the planner switching strategies at
+a different table size) — that's the thing actually being relied on here,
+not the absence of an `OR` for its own sake.
+
+## enqueue_many: two statements, not one CTE
+
+Chose `INSERT ... ON CONFLICT DO NOTHING`, then a separate `SELECT` (plus
+the `links` insert) as a second statement. Rejected doing both in one
+`WITH` query. Verified against Postgres directly: when two transactions
+insert the same brand-new URL at the same instant, the loser's own
+`INSERT` correctly waits and resolves the conflict once the winner
+commits — but a sibling read in the *same* statement (an `existing` CTE
+probing the table directly) runs against the snapshot taken at statement
+start, before that commit, and never sees the row. Splitting the read into
+its own statement gives it a fresh snapshot, taken after the first
+statement has already returned — by which point every conflicting insert
+it raced against has resolved one way or the other. Read Committed's
+per-statement snapshot is what makes this safe; REPEATABLE READ pins one
+snapshot for the whole transaction, so the same `INSERT` there raises
+"could not serialize access due to concurrent update" instead of silently
+missing the row — louder, but it would mean adding retry-on-serialization
+handling around this call, which Read Committed doesn't need. Would
+reconsider if this pool's default isolation level ever moves off Read
+Committed.
+
+The 40001 comes from the same check Postgres applies to any `UPDATE`,
+`DELETE`, or `SELECT FOR UPDATE`/`FOR SHARE` that finds its target row was
+concurrently changed by a transaction that has since committed — the docs
+describe it for that case as "the second updater will get a serialization
+failure error." `INSERT ... ON CONFLICT` hits the identical check: deciding
+`DO NOTHING` vs. actually inserting is a predicate over the conflicting
+row, exactly like an `UPDATE`'s `WHERE` clause is, and evaluating it after
+a wait means looking at a row version that didn't exist under the
+transaction's original snapshot. Under Read Committed each statement calls
+`GetTransactionSnapshot()` fresh — `IsolationUsesXactSnapshot()` is false
+— so re-evaluating against the now-committed row is just a normal
+statement-scoped re-check, no violation, no error. Under REPEATABLE
+READ/SERIALIZABLE, `IsolationUsesXactSnapshot()` is true: the one snapshot
+taken at the transaction's first query is reused for every later
+statement, so there is no fresher snapshot to fall back to without
+breaking the promise that every read in the transaction sees one fixed
+point in time — Postgres won't quietly answer the conflict question using
+data outside that snapshot, so it raises 40001 and pushes the retry back
+to the client instead. This is Postgres's snapshot-isolation "first
+updater wins" rule, and `DO NOTHING` was never exempt from it — only a
+conflict already visible in the original snapshot (no wait needed) skips
+the check entirely, which is the case the docs' "no error" language
+actually describes.
+
+## Migrations: advisory lock; frontier: none
+
+Chose a global advisory lock around the migration runner. Rejected using
+one anywhere in `store/frontier.py`. Migrations run once, at boot, with no
+per-row unit of work — coarse and rare is the right shape. The frontier is
+the opposite: continuous, per-row, high-frequency, and Postgres's own row
+locks (`FOR UPDATE SKIP LOCKED`, or the lock a plain `UPDATE ... WHERE id
+= $1` already takes) already give the right granularity. An advisory lock
+around frontier writes would serialize every worker into single file,
+which is the concurrency the schema exists to provide. Would reconsider if
+a frontier operation ever needed to span more than one row atomically in a
+way row locks can't express.
