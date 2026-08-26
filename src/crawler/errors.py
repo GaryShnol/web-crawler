@@ -6,9 +6,9 @@ live in fetch/retry.py and fetch/client.py, driven by what classify() returns.
 import enum
 from dataclasses import dataclass
 
-from aiohttp import ClientConnectionError
+from aiohttp import ClientConnectionError, ClientPayloadError
 
-from .models import FetchResponse, Outcome
+from .models import FetchResponse, Outcome, find_header
 
 _PERMANENT_STATUSES = {404, 403}
 _TEMPORARY_STATUSES = {429, 500}
@@ -23,6 +23,7 @@ class ErrorKind(enum.Enum):
     SERVER_ERROR = "server_error"
     EMPTY_BODY = "empty_body"
     TRUNCATED_BODY = "truncated_body"
+    BODY_TOO_LARGE = "body_too_large"
     UNEXPECTED_STATUS = "unexpected_status"
     TIMEOUT = "timeout"
     CONNECTION_ERROR = "connection_error"
@@ -55,12 +56,12 @@ def classify(response: FetchResponse, prev_etag: str | None = None) -> Classific
         return Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.UNEXPECTED_STATUS)
 
     if not response.body:
-        etag = response.header("ETag")
+        etag = find_header(response.headers, "ETag")
         if etag is not None and etag == prev_etag:
             return Classification(Outcome.NOT_MODIFIED, None)
         return Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.EMPTY_BODY)
 
-    declared = response.header("Content-Length")
+    declared = find_header(response.headers, "Content-Length")
     if declared is not None:
         try:
             mismatch = int(declared) != len(response.body)
@@ -72,17 +73,31 @@ def classify(response: FetchResponse, prev_etag: str | None = None) -> Classific
     return Classification(Outcome.SUCCESS, None)
 
 
-def classify_exception(exc: TimeoutError | ClientConnectionError) -> Classification:
+def classify_oversized_body() -> Classification:
+    """The one shape a body-too-large refusal can take. fetch/client.py stops
+    reading once the response has run past `max_body_bytes` — before a
+    status code or headers are even fully received, so there's nothing left
+    to interpret the way classify() interprets a complete response. PERMANENT
+    because a retry meets the same oversized body.
+    """
+    return Classification(Outcome.PERMANENT_FAILURE, ErrorKind.BODY_TOO_LARGE)
+
+
+def classify_exception(
+    exc: TimeoutError | ClientConnectionError | ClientPayloadError,
+) -> Classification:
     """Same closed outcome set for a fetch that never produced a response.
 
-    Only the two kinds fetch/client.py actually catches are named here. An
+    Only the kinds fetch/client.py actually catches are named here. An
     exception of any other type is a bug, not network flakiness, and gets
     re-raised rather than folded into TEMPORARY_FAILURE — that would turn a
     bug in this codebase into a retry loop that looks like a flaky network
-    and never surfaces as a failure to find.
+    and never surfaces as a failure to find. ClientPayloadError (the
+    connection dying mid-body) is grouped with ClientConnectionError: both
+    are the transport failing, not a status the service returned.
     """
     if isinstance(exc, TimeoutError):
         return Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.TIMEOUT)
-    if isinstance(exc, ClientConnectionError):
+    if isinstance(exc, (ClientConnectionError, ClientPayloadError)):
         return Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.CONNECTION_ERROR)
     raise exc
