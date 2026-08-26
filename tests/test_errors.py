@@ -3,7 +3,13 @@
 import aiohttp
 import pytest
 
-from crawler.errors import Classification, ErrorKind, classify, classify_exception
+from crawler.errors import (
+    Classification,
+    ErrorKind,
+    classify,
+    classify_exception,
+    classify_oversized_body,
+)
 from crawler.models import FetchResponse, Outcome
 
 
@@ -87,6 +93,12 @@ class TestEmptyBodyAndConditionalHit:
         assert result == Classification(Outcome.NOT_MODIFIED, None)
 
 
+class TestBodyTooLarge:
+    def test_oversized_body_is_permanent(self):
+        result = classify_oversized_body()
+        assert result == Classification(Outcome.PERMANENT_FAILURE, ErrorKind.BODY_TOO_LARGE)
+
+
 class TestClassifyException:
     def test_timeout_is_temporary(self):
         result = classify_exception(TimeoutError())
@@ -94,6 +106,12 @@ class TestClassifyException:
 
     def test_connection_error_is_temporary(self):
         result = classify_exception(aiohttp.ClientConnectionError())
+        assert result == Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.CONNECTION_ERROR)
+
+    def test_payload_error_is_temporary_connection_error(self):
+        # a body that dies mid-stream is the transport failing, not a status
+        # the service returned — grouped with ClientConnectionError.
+        result = classify_exception(aiohttp.ClientPayloadError())
         assert result == Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.CONNECTION_ERROR)
 
     def test_connection_error_subclass_is_temporary(self):
