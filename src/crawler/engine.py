@@ -134,6 +134,9 @@ def _install_signal_handlers(stop_claiming: asyncio.Event, force_stop: asyncio.E
 
 
 async def run(config: Config, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep) -> int:
+    if config.seed_url is None:
+        raise ValueError("seed_url is required to crawl")
+
     pool = await db.create_pool(config)
     try:
         await db.run_migrations(pool, MIGRATIONS_DIR)

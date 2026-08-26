@@ -10,6 +10,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
+import pytest
 from aiohttp.test_utils import TestServer
 from conftest import TEST_DATABASE_URL
 from fake_api.app import FakeResponse, create_app
@@ -209,6 +210,11 @@ class TestRunEndToEnd:
         assert exit_code == 0
         row = await pool.fetchrow("SELECT status FROM urls WHERE normalized_url = $1", seed)
         assert row["status"] == "done"
+
+    async def test_a_missing_seed_url_is_rejected_before_touching_the_pool(self):
+        config = Config(database_url=TEST_DATABASE_URL, fetch_api_url="http://unused/unused")
+        with pytest.raises(ValueError, match="seed_url"):
+            await run(config)
 
 
 def _config() -> Config:

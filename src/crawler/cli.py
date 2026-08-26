@@ -97,9 +97,7 @@ def main(argv: list[str] | None = None) -> int:
         configure_logging(config.log_level)
         return asyncio.run(run(config))
 
-    # stats never crawls -- seed_url is a required Config field it never
-    # reads, so this placeholder is all it needs.
-    config = Config(seed_url="stats:unused")
+    config = Config()  # stats never crawls; seed_url stays unset
     return asyncio.run(_run_stats(config, args.since))
 
 
