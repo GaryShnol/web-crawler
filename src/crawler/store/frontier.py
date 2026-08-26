@@ -155,6 +155,16 @@ async def crawl_complete(conn: asyncpg.Connection) -> bool:
     return row["complete"]
 
 
+async def status_counts(conn: asyncpg.Connection) -> dict[str, int]:
+    """Every status currently present in `urls`, with its row count. A
+    status nothing has reached yet just doesn't appear — a caller that
+    needs a fixed set (engine.py's progress line, `crawler stats`)
+    defaults the ones it asks for.
+    """
+    rows = await conn.fetch("SELECT status, count(*) FROM urls GROUP BY status")
+    return {r["status"]: r["count"] for r in rows}
+
+
 async def mark_done(
     conn: asyncpg.Connection,
     url_id: int,

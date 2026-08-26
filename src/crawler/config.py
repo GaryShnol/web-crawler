@@ -27,6 +27,7 @@ class Config(BaseSettings):
     lease_recovery_interval_seconds: float | None = None
     poll_interval_seconds: float = 1.0
     shutdown_grace_seconds: float = 30.0
+    progress_interval_seconds: float = 10.0
 
     rate_limit_min_rps: float = 0.5
     rate_limit_decrease_factor: float = 0.5

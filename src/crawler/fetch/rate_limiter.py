@@ -36,6 +36,14 @@ class RateLimiter:
         self._success_streak = 0
         self._lock = asyncio.Lock()
 
+    @property
+    def current_rate(self) -> float:
+        """The AIMD ceiling in effect right now — what `acquire()` is
+        currently pacing to, not necessarily what's actually happening if
+        there's little work queued.
+        """
+        return self._rate
+
     def _capacity(self) -> float:
         """Burst allowance: one second of the *current* rate, floor 1. If
         this didn't shrink with the rate, a multiplicative cut wouldn't bite
