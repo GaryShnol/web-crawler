@@ -84,8 +84,39 @@ A module gets created when it has work to do, not before.
 
 ## Where things stand
 
-Feature 0 done, no application code yet. Signatures and the schema get written
-in here as steps land.
+Features 1 and 2 are merged into `main`. Next step is 3.1, the schema — nothing
+under `store/` exists yet, and neither do `handlers/`, `worker.py`, `engine.py`
+or `cli.py`.
+
+What's written and merged:
+
+```
+models.py    Outcome, FetchResponse(status_code, headers, body),
+             FetchResult(outcome, elapsed, resolved_url, response),
+             find_header, parse_retry_after, encode_body/decode_body
+errors.py    ErrorKind, Classification,
+             classify(response, prev_etag=None),
+             classify_oversized_body(),
+             classify_exception(TimeoutError | ClientConnectionError | ClientPayloadError)
+url_tools.py normalize(url, base=None), in_scope(url, seed_host, allow_subdomains)
+config.py    Config (pydantic-settings)
+logging.py   json to stdout, bindable context, level from config.log_level
+fetch/       FetchClient(config) as an async context manager, fetch(url, prev_etag=None) -> FetchResult
+             RateLimiter(config, now=monotonic, sleep=asyncio.sleep): acquire(), report(throttled, retry_after)
+             next_attempt(outcome, attempt_no, headers, now, config, jitter=None) -> GiveUp | RetryAt
+tests/fake_api/  the test double, plus test_* for everything above
+```
+
+Config keys as they stand: `seed_url`, `database_url`, `fetch_api_url`,
+`max_concurrency`, `max_depth`, `requests_per_second`, `max_attempts`,
+`lease_seconds`, `max_body_bytes`, `connect_timeout_seconds`,
+`read_timeout_seconds`, `allow_subdomains`, `rate_limit_min_rps`,
+`rate_limit_decrease_factor`, `rate_limit_recovery_successes`,
+`rate_limit_increase_rps`, `retry_base_seconds`, `retry_max_seconds`,
+`output_dir`, `log_level`. `max_redirects` is gone — see the redirect decision
+in DESIGN.md.
+
+The schema and the rest of the signatures get written in here as steps land.
 
 ## Decisions already made
 
