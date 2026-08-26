@@ -84,62 +84,118 @@ A module gets created when it has work to do, not before.
 
 ## Where things stand
 
-Features 1 and 2 are merged into `main`. 3.1 and 3.2 are committed on
-`feature/3-frontier`, not yet merged. Next step is 3.3, the concurrency test.
-`handlers/`, `worker.py`, `engine.py`, `cli.py`, `store/blobs.py` and
-`store/metadata.py` still don't exist.
+Features 1–4 are merged into `main`. `feature/5-hardening` is committed but
+not merged: change detection (5.2), observability (5.3), docker-compose and
+the Makefile (5.4). 5.1 — the SIGKILL resumability test — was never written.
 
-What's written and merged:
+### What is actually missing
+
+Feature 4 is not finished, and this section claimed otherwise for long enough
+that a later session inferred from `git log` that the handlers existed. They
+do not. All of the following surfaced from running `docker compose up` for the
+first time, not from reading the code:
+
+- **Three of the four handlers don't exist.** There is no
+  `handlers/image.py`, `handlers/pdf.py` or `handlers/video.py`, and
+  `handlers/__init__.py` imports `html` alone — so every image, PDF and video
+  in a crawl lands as `skipped`. Three of the assignment's four required
+  content types are never downloaded, processed or persisted.
+- **`handlers/html.py` extracts `a[href]` and nothing else.** No `<title>`,
+  no `content_metadata` payload (it returns `metadata=None`), no `<base
+  href>` handling, and no `src` attributes — which is why images, videos and
+  PDFs referenced by `img`/`video`/`embed` never reach the frontier at all.
+  Its own module docstring says so.
+- **`docker compose up` cannot finish a crawl.** It hangs on the first fetch,
+  reproducibly, even at `MAX_CONCURRENCY=1`, and does not reproduce outside
+  Docker. Network from inside the stuck container is fine and Postgres has
+  nothing blocked, so the two live suspects are (a) connection-pool
+  exhaustion — 5.3 added `_progress` as a third `pool.acquire()` consumer
+  beside `_supervise` and every worker, so check what `create_pool` derives
+  `max_size` from — and (b) the rate limiter starving, since `acquire()` runs
+  before any network call and an ungranted token is indistinguishable from a
+  fetch that never returns.
+- **There is no `README.md`.**
+
+Next, in order: the hang, then the three handlers plus html's missing
+extraction, then the two-run change-detection demo, then review and delivery.
+
+### Merged and working
 
 ```
 models.py    Outcome, FetchResponse(status_code, headers, body),
              FetchResult(outcome, elapsed, resolved_url, response),
              find_header, parse_retry_after, encode_body/decode_body
-errors.py    ErrorKind, Classification,
-             classify(response, prev_etag=None),
-             classify_oversized_body(),
-             classify_exception(TimeoutError | ClientConnectionError | ClientPayloadError)
+errors.py    ErrorKind, Classification, classify(response, prev_etag=None),
+             classify_oversized_body(), classify_exception(...)
 url_tools.py normalize(url, base=None), in_scope(url, seed_host, allow_subdomains)
-config.py    Config (pydantic-settings)
+config.py    Config (pydantic-settings) — seed_url is optional; only
+             engine.run() requires it, so `stats` needs no placeholder
 logging.py   json to stdout, bindable context, level from config.log_level
-fetch/       FetchClient(config) as an async context manager, fetch(url, prev_etag=None) -> FetchResult
-             RateLimiter(config, now=monotonic, sleep=asyncio.sleep): acquire(), report(throttled, retry_after)
-             next_attempt(outcome, attempt_no, headers, now, config, jitter=None) -> GiveUp | RetryAt
-tests/fake_api/  the test double, plus test_* for everything above
-```
 
-On `feature/3-frontier`, not yet merged:
+fetch/       FetchClient(config) async CM, fetch(url, prev_etag=None) -> FetchResult
+             RateLimiter(config, now=monotonic, sleep=asyncio.sleep)
+                 acquire(), report(throttled, retry_after), current_rate (property)
+             next_attempt(outcome, attempt_no, headers, now, config, jitter=None)
+                 -> GiveUp | RetryAt
 
-```
-migrations/001_init.sql
-             contents(content_hash PK, content_type, byte_size, storage_path,
-                      first_seen_at)
-             urls(id, normalized_url UNIQUE, raw_url, depth, status, attempts,
-                  next_attempt_at, lease_until, content_type, content_length,
-                  content_hash FK->contents, etag, error_kind, error_message,
-                  discovered_at, last_seen_at, updated_at)
-             content_metadata(content_hash PK FK, kind, payload JSONB)
-             links(src_id, dst_id, anchor_text, PK(src_id, dst_id))
-             fetch_attempts(id, url_id, attempt_no, status_code, duration_ms,
-                            error_kind, created_at)
-             partial indexes: (next_attempt_at) WHERE status='pending',
-                              (lease_until)     WHERE status='in_progress'
+migrations/  001_init.sql  contents / urls / content_metadata / links /
+                           fetch_attempts, plus partial indexes on
+                           (next_attempt_at) WHERE status='pending' and
+                           (lease_until) WHERE status='in_progress'
+             002_skipped_status.sql  urls.status gains 'skipped';
+                           urls.lease_token UUID fences terminal writes to
+                           the claim that actually made them
+             003_content_changed_at.sql  urls.content_changed_at TIMESTAMPTZ
+
 store/db.py  create_pool(config), run_migrations(pool, migrations_dir)
-             advisory-lock guarded, applies migrations/*.sql in filename order
 store/frontier.py
-             ClaimedUrl(id, url, attempt_no, etag)
+             ClaimedUrl(id, url, depth, attempt_no, etag, lease_token)
              DiscoveredLink(raw_url, normalized_url, anchor_text)
-             claim_batch(pool, limit, config) -> list[ClaimedUrl]
-             mark_done(pool, url_id, *, content_type, content_length,
-                       content_hash, etag)
-             mark_failed(pool, url_id, decision: GiveUp | RetryAt, error_kind,
+             claim_batch(conn, limit, config) -> list[ClaimedUrl]
+             mark_done(conn, url_id, lease_token, *, content_type,
+                       content_length, content_hash, etag) -> str | None
+                 returns the row's own pre-update content_hash (None on a
+                 first fetch) via a CTE, and moves content_changed_at in the
+                 same statement when that prior hash differs
+             mark_unchanged(conn, url_id, lease_token)
+             mark_skipped(conn, url_id, lease_token, *, content_type,
+                          content_length)
+             mark_failed(conn, url_id, lease_token, decision, error_kind,
                          error_message=None)
-             record_attempt(pool, url_id, attempt_no, *, status_code, elapsed,
-                            error_kind=None)
-             release(pool, url_id)
-             recover_expired_leases(pool) -> int
-             enqueue_many(pool, links: list[DiscoveredLink], depth,
-                          src_id=None) -> dict[normalized_url, id]
+             record_attempt(conn, url_id, attempt_no, *, status_code,
+                            elapsed, error_kind=None)
+             release(conn, url_id, lease_token)
+             recover_expired_leases(conn) -> int
+             crawl_complete(conn) -> bool
+             status_counts(conn) -> dict[str, int]
+             enqueue_many(conn, links, depth, src_id=None) -> dict[str, int]
+store/blobs.py
+             write(output_dir, directory, extension, url, body)
+                 -> (content_hash, storage_path)
+store/metadata.py
+             insert_content(conn, content_hash, content_type, byte_size,
+                            storage_path)
+             insert_metadata(conn, content_hash, kind, payload)
+store/stats.py   read-only, nothing in the live crawl calls it
+             Stats(status_counts, failure_reasons, attempts_total,
+                   urls_attempted, bytes_by_type, dedup_total,
+                   dedup_distinct, changed_count)
+             gather(conn, since=None) -> Stats
+
+handlers/base.py
+             HandlerResult(metadata: dict | None, links: list[DiscoveredLink])
+             Handler protocol: kind, directory, extension, sniff(body),
+                               handle(body, url) -> HandlerResult
+             register(content_type), resolve(content_type, body) -> Handler | None
+handlers/html.py  HtmlHandler — kind "page", links only (see above)
+
+worker.py    process_one(...) — one structured "url completed" log line per
+             url, carrying outcome (done/skipped/unchanged/retrying/failed)
+             plus kind/links/hash_changed or error_kind
+engine.py    run(config, sleep=asyncio.sleep) -> int — bounded pool, lease
+             supervisor, progress task, graceful shutdown
+cli.py       `crawl <seed>` and `stats [--since <iso8601>]` (text report)
+tests/       fake_api/ test double + test_* for everything above
 ```
 
 `attempts` is incremented only by `claim_batch`'s own statement — not by
@@ -148,16 +204,19 @@ store/frontier.py
 `fetch/retry.py`'s and arrives as an argument. `mark_done` requires a matching
 `contents` row to already exist, so the blob is written before it is called.
 
-Config keys as they stand: `seed_url`, `database_url`, `fetch_api_url`,
+Config keys: `seed_url` (optional), `database_url`, `fetch_api_url`,
 `max_concurrency`, `max_depth`, `requests_per_second`, `max_attempts`,
 `lease_seconds`, `max_body_bytes`, `connect_timeout_seconds`,
-`read_timeout_seconds`, `allow_subdomains`, `rate_limit_min_rps`,
-`rate_limit_decrease_factor`, `rate_limit_recovery_successes`,
-`rate_limit_increase_rps`, `retry_base_seconds`, `retry_max_seconds`,
-`output_dir`, `log_level`. `max_redirects` is gone — see the redirect decision
-in DESIGN.md.
+`read_timeout_seconds`, `allow_subdomains`, `lease_recovery_interval_seconds`,
+`poll_interval_seconds`, `shutdown_grace_seconds`, `progress_interval_seconds`,
+`rate_limit_min_rps`, `rate_limit_decrease_factor`,
+`rate_limit_recovery_successes`, `rate_limit_increase_rps`,
+`retry_base_seconds`, `retry_max_seconds`, `output_dir`, `log_level`.
+`max_redirects` is gone — see the redirect decision in DESIGN.md.
 
-The schema and the rest of the signatures get written in here as steps land.
+**Keep this section current at the end of every step.** It is the only thing
+standing between a fresh session and a wrong assumption about what exists; the
+missing handlers above survived undetected precisely because it went stale.
 
 ## Decisions already made
 
