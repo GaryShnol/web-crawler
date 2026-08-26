@@ -188,6 +188,16 @@ async def mark_done(
     against it unqualified without one (Postgres evaluates SET against the
     pre-update row), but RETURNING only ever sees the row after — so
     getting the prior hash *out* needs the CTE regardless.
+
+    `prior` is a snapshot taken at the start of this statement, in
+    principle stale by the time the UPDATE locks the row — but that
+    window can't actually land a wrong comparison here. `content_hash` is
+    only ever written by this function, always gated on `lease_token`
+    matching, and a given token is only ever valid for one caller at a
+    time (freshly minted, once, by the claim_batch call that handed it
+    out). Nothing else can be concurrently writing `content_hash` on this
+    row under the same token while this statement runs, so the value
+    `prior` captured is still exactly what's about to be overwritten.
     """
     row = await conn.fetchrow(
         """
