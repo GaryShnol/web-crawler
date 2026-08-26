@@ -18,7 +18,7 @@ RUN uv sync --frozen --no-dev
 COPY src/ ./src/
 
 
-FROM python:3.12-slim
+FROM python:3.12-slim AS crawler
 
 # ffmpeg for ffprobe, used by the video handler to read duration.
 RUN apt-get update \
@@ -30,6 +30,7 @@ RUN groupadd -g 1000 appuser && useradd -u 1000 -g appuser -m appuser
 WORKDIR /app
 COPY --from=builder --chown=appuser:appuser /app/.venv ./.venv
 COPY --from=builder --chown=appuser:appuser /app/src ./src
+COPY --chown=appuser:appuser migrations/ ./migrations/
 RUN chown appuser:appuser /app
 
 ENV PATH="/app/.venv/bin:${PATH}" \
@@ -37,4 +38,8 @@ ENV PATH="/app/.venv/bin:${PATH}" \
 
 USER appuser
 
-CMD ["python", "-m", "crawler.cli"]
+# ENTRYPOINT, not CMD: `docker compose run crawler stats` (or `crawl <seed>`)
+# has to append an argument to this, not replace the whole command -- CMD
+# would be replaced wholesale and try to exec a binary literally named
+# "stats".
+ENTRYPOINT ["python", "-m", "crawler.cli"]
