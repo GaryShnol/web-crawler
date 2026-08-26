@@ -164,3 +164,38 @@ class TestUnchangedFullBody:
         assert second["content_hash"] == first["content_hash"]
         assert second["content_changed_at"] is None  # same hash: never counted as a change
         assert list((tmp_path / "pages").iterdir()) == blobs_after_first  # no new file written
+
+
+class TestChangedFullBody:
+    async def test_different_hash_revisit_moves_content_changed_at(self, pool, tmp_path):
+        page = "http://fixture.local/drifting"
+        routes = {
+            page: [
+                FakeResponse(200, {"Content-Type": "text/html"}, b"<html><body>version one</body></html>"),
+                FakeResponse(200, {"Content-Type": "text/html"}, b"<html><body>version two</body></html>"),
+            ]
+        }
+        row = await pool.fetchrow(
+            "INSERT INTO urls (normalized_url, raw_url) VALUES ($1, $1) RETURNING id", page
+        )
+        url_id = row["id"]
+
+        async with _running(routes) as server:
+            config = _config(str(server.make_url("/fetch")), tmp_path)
+            async with FetchClient(config) as fetch_client:
+                await _process_pending(pool, url_id, config, fetch_client)  # first fetch
+
+                first = await _row(pool, url_id)
+                assert first["content_changed_at"] is None  # baseline, not a change
+
+                await pool.execute(
+                    "UPDATE urls SET status = 'pending', next_attempt_at = now() WHERE id = $1",
+                    url_id,
+                )
+                await _process_pending(pool, url_id, config, fetch_client)  # revisit, different body
+
+        second = await _row(pool, url_id)
+        assert second["content_hash"] is not None
+        assert second["content_hash"] != first["content_hash"]
+        assert second["content_changed_at"] is not None  # different hash: a real change
+        assert len(list((tmp_path / "pages").iterdir())) == 2  # both bodies got their own blob
