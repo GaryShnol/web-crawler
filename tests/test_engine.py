@@ -64,7 +64,6 @@ class TestSupervise:
                 content_length=None,
                 content_hash=None,
                 etag=None,
-                previous_hash=None,
             )
 
         await asyncio.wait_for(task, timeout=5)
