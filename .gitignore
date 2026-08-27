@@ -221,3 +221,6 @@ __marimo__/
 
 
 .claude/
+
+# Flattened source dumps generated to paste into a review session
+review-bundle.txt
