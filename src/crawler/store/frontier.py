@@ -48,6 +48,10 @@ class DiscoveredLink:
     raw_url: str
     normalized_url: str
     anchor_text: str | None
+    # True for an img/video/source/embed src: a leaf, fetched regardless of
+    # host (CLAUDE.md's off-host-assets decision). False (the default) for
+    # an a[href], which worker.py still gates on in_scope.
+    is_asset: bool = False
 
 
 def _warn_if_lost_race(result: str, url_id: int, action: str) -> None:

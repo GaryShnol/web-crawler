@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 import asyncpg
 
 from .config import Config
-from .errors import ErrorKind
+from .errors import ErrorKind, classify_unparseable_content
 from .fetch.client import FetchClient
 from .fetch.rate_limiter import RateLimiter
 from .fetch.retry import GiveUp, next_attempt
@@ -77,14 +77,37 @@ async def _persist_success(
             )
         return {"outcome": "skipped"}
 
-    handled = handler.handle(response.body, claimed.url)
+    try:
+        handled = handler.handle(response.body, claimed.url)
+    except Exception:
+        # A body that passed handler.sniff() can still be truncated,
+        # corrupt, or (a PDF) encrypted -- real conditions this crawler is
+        # meant to survive, not a bug in this codebase. Nothing's been
+        # written yet (blobs.write hasn't run), so this leaves no orphaned
+        # blob or contents row -- just a failure/retry outcome, same shape
+        # as a fetch-level one.
+        logger.exception("handler failed to parse a sniff-matched body", extra={"context": {"kind": handler.kind}})
+        classification = classify_unparseable_content()
+        decision = next_attempt(
+            classification.outcome,
+            claimed.attempt_no,
+            response.headers,
+            datetime.now(UTC),
+            config,
+            jitter=random.random(),
+        )
+        async with pool.acquire() as conn, conn.transaction():
+            await frontier.mark_failed(conn, claimed.id, claimed.lease_token, decision, classification.error_kind)
+        outcome = "failed" if isinstance(decision, GiveUp) else "retrying"
+        return {"outcome": outcome, "error_kind": classification.error_kind.value}
+
     content_hash, storage_path = blobs.write(
         config.output_dir, handler.directory, handler.extension, claimed.url, response.body
     )
-    in_scope_links = [
+    enqueueable_links = [
         link
         for link in handled.links
-        if in_scope(link.normalized_url, seed_host, config.allow_subdomains)
+        if link.is_asset or in_scope(link.normalized_url, seed_host, config.allow_subdomains)
     ]
     next_depth = claimed.depth + 1
     within_depth = config.max_depth is None or next_depth <= config.max_depth
@@ -95,8 +118,8 @@ async def _persist_success(
         )
         if handled.metadata is not None:
             await metadata.insert_metadata(conn, content_hash, handler.kind, handled.metadata)
-        if in_scope_links and within_depth:
-            await frontier.enqueue_many(conn, in_scope_links, depth=next_depth, src_id=claimed.id)
+        if enqueueable_links and within_depth:
+            await frontier.enqueue_many(conn, enqueueable_links, depth=next_depth, src_id=claimed.id)
         previous_hash = await frontier.mark_done(
             conn,
             claimed.id,
@@ -107,7 +130,11 @@ async def _persist_success(
             etag=find_header(response.headers, "ETag"),
         )
 
-    context: dict[str, object] = {"outcome": "done", "kind": handler.kind, "links": len(in_scope_links)}
+    context: dict[str, object] = {
+        "outcome": "done",
+        "kind": handler.kind,
+        "links": len(enqueueable_links),
+    }
     if previous_hash is not None:  # only a revisit has a hash to compare against
         context["hash_changed"] = previous_hash != content_hash
     return context

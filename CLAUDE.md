@@ -90,34 +90,38 @@ the Makefile (5.4). 5.1 — the SIGKILL resumability test — was never written.
 
 ### What is actually missing
 
-Feature 4 is not finished, and this section claimed otherwise for long enough
-that a later session inferred from `git log` that the handlers existed. They
-do not. All of the following surfaced from running `docker compose up` for the
-first time, not from reading the code:
+Feature 4 is finished as of this session: all four handlers exist and
+`handlers/html.py` extracts what CLAUDE.md's "What I'm building" promises. The
+two-run change-detection demo has been run once, manually, outside Docker
+(below) — it hasn't been run through `docker compose up` because that still
+hangs (next bullet), and it isn't wired into any test yet.
 
-- **Three of the four handlers don't exist.** There is no
-  `handlers/image.py`, `handlers/pdf.py` or `handlers/video.py`, and
-  `handlers/__init__.py` imports `html` alone — so every image, PDF and video
-  in a crawl lands as `skipped`. Three of the assignment's four required
-  content types are never downloaded, processed or persisted.
-- **`handlers/html.py` extracts `a[href]` and nothing else.** No `<title>`,
-  no `content_metadata` payload (it returns `metadata=None`), no `<base
-  href>` handling, and no `src` attributes — which is why images, videos and
-  PDFs referenced by `img`/`video`/`embed` never reach the frontier at all.
-  Its own module docstring says so.
-- **`docker compose up` cannot finish a crawl.** It hangs on the first fetch,
-  reproducibly, even at `MAX_CONCURRENCY=1`, and does not reproduce outside
-  Docker. Network from inside the stuck container is fine and Postgres has
-  nothing blocked, so the two live suspects are (a) connection-pool
-  exhaustion — 5.3 added `_progress` as a third `pool.acquire()` consumer
-  beside `_supervise` and every worker, so check what `create_pool` derives
-  `max_size` from — and (b) the rate limiter starving, since `acquire()` runs
-  before any network call and an ungranted token is indistinguishable from a
-  fetch that never returns.
-- **There is no `README.md`.**
+- **`docker compose up` still cannot finish a crawl.** Untouched this
+  session — the demo below runs the crawler as a local `uv run` process
+  against the same test Postgres container (`crawler-test-pg`,
+  `localhost:55432`) and a locally-started `fake_api`, specifically to route
+  around this bug rather than depend on it being fixed. It hangs on the
+  first fetch, reproducibly, even at `MAX_CONCURRENCY=1`, and does not
+  reproduce outside Docker. Network from inside the stuck container is fine
+  and Postgres has nothing blocked, so the two live suspects are (a)
+  connection-pool exhaustion — 5.3 added `_progress` as a third
+  `pool.acquire()` consumer beside `_supervise` and every worker, so check
+  what `create_pool` derives `max_size` from — and (b) the rate limiter
+  starving, since `acquire()` runs before any network call and an ungranted
+  token is indistinguishable from a fetch that never returns.
+- **There is no `README.md`.** The two-run table below is meant to land in
+  it, not stand alone.
+- **`handlers/html.py` still doesn't honour `<base href>`.** Resolution
+  always uses the page's own url — unchanged from before this session, and
+  not part of what was asked for this step.
+- **`handlers/image.py` only registers PNG.** Sniffed by real PNG magic
+  bytes, not by asking Pillow to open anything — a second raster format
+  (JPEG, GIF, WebP) is one more `@register`'d file, same shape as this one,
+  whenever something actually needs it. The fixture site only ever serves
+  PNG.
 
-Next, in order: the hang, then the three handlers plus html's missing
-extraction, then the two-run change-detection demo, then review and delivery.
+Next, in order: the hang, then a `README.md` (the table below is the seed for
+its change-detection section), then review and delivery.
 
 ### Merged and working
 
@@ -150,7 +154,11 @@ migrations/  001_init.sql  contents / urls / content_metadata / links /
 store/db.py  create_pool(config), run_migrations(pool, migrations_dir)
 store/frontier.py
              ClaimedUrl(id, url, depth, attempt_no, etag, lease_token)
-             DiscoveredLink(raw_url, normalized_url, anchor_text)
+             DiscoveredLink(raw_url, normalized_url, anchor_text, is_asset=False)
+                 is_asset is True for an img/video/source/embed src — worker.py
+                 enqueues it regardless of host, bypassing in_scope, since it's
+                 a leaf (CLAUDE.md's off-host-assets decision). False (an
+                 a[href]) still goes through in_scope like before.
              claim_batch(conn, limit, config) -> list[ClaimedUrl]
              mark_done(conn, url_id, lease_token, *, content_type,
                        content_length, content_hash, etag) -> str | None
@@ -187,7 +195,23 @@ handlers/base.py
              Handler protocol: kind, directory, extension, sniff(body),
                                handle(body, url) -> HandlerResult
              register(content_type), resolve(content_type, body) -> Handler | None
-handlers/html.py  HtmlHandler — kind "page", links only (see above)
+handlers/html.py   HtmlHandler "text/html" — kind "page", dir "pages", ext "html"
+                   links: a[href] (is_asset=False) plus img/video/source/embed
+                   src (is_asset=True); metadata {title, link_count} over all
+                   of them combined. No <base href> support.
+handlers/image.py  ImageHandler "image/png" — kind "image", dir "images", ext "png"
+                   sniffed by the PNG magic bytes; metadata {width, height,
+                   file_size} via Pillow. PNG only — see "what's missing".
+handlers/pdf.py    PdfHandler "application/pdf" — kind "pdf", dir "pdfs", ext "pdf"
+                   sniffed by the %PDF- header; metadata {page_count, title}
+                   via pypdf (title is null when the PDF sets none).
+handlers/video.py  VideoHandler "video/mp4" — kind "video", dir "videos", ext "mp4"
+                   sniffed by the ftyp box; metadata {file_size, duration_seconds,
+                   duration_unavailable_reason?} — the reason key is only present
+                   when duration_seconds is null (ffprobe missing from PATH, or
+                   present but the container has nothing for it to read).
+                   ffprobe runs against a throwaway temp file, since handle()
+                   only ever gets bytes, never a path.
 
 worker.py    process_one(...) — one structured "url completed" log line per
              url, carrying outcome (done/skipped/unchanged/retrying/failed)

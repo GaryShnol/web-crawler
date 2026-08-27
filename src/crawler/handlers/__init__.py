@@ -6,3 +6,6 @@ file and its one `@register(...)` decorator.
 """
 
 from . import html as _html  # noqa: F401 — imported for its @register side effect
+from . import image as _image  # noqa: F401 — imported for its @register side effect
+from . import pdf as _pdf  # noqa: F401 — imported for its @register side effect
+from . import video as _video  # noqa: F401 — imported for its @register side effect
