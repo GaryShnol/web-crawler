@@ -21,7 +21,7 @@ from .config import Config
 from .errors import ErrorKind
 from .fetch.client import FetchClient
 from .fetch.rate_limiter import RateLimiter
-from .fetch.retry import next_attempt
+from .fetch.retry import GiveUp, next_attempt
 from .handlers import base as handlers
 from .logging import bind
 from .models import FetchResult, Outcome, find_header, parse_retry_after
@@ -56,7 +56,11 @@ async def _persist_success(
     result: FetchResult,
     config: Config,
     seed_host: str,
-) -> None:
+) -> dict[str, object]:
+    """Writes what landed and returns the fields the one completion line
+    logs for it — never logs itself, so success, failure and NOT_MODIFIED
+    all resolve to exactly one log call, in process_one.
+    """
     response = result.response
     assert response is not None and response.body
     content_type = find_header(response.headers, "Content-Type")
@@ -71,8 +75,7 @@ async def _persist_success(
                 content_type=content_type,
                 content_length=len(response.body),
             )
-        logger.info("skipped: no handler matched")
-        return
+        return {"outcome": "skipped"}
 
     handled = handler.handle(response.body, claimed.url)
     content_hash, storage_path = blobs.write(
@@ -94,7 +97,7 @@ async def _persist_success(
             await metadata.insert_metadata(conn, content_hash, handler.kind, handled.metadata)
         if in_scope_links and within_depth:
             await frontier.enqueue_many(conn, in_scope_links, depth=next_depth, src_id=claimed.id)
-        await frontier.mark_done(
+        previous_hash = await frontier.mark_done(
             conn,
             claimed.id,
             claimed.lease_token,
@@ -103,12 +106,16 @@ async def _persist_success(
             content_hash=content_hash,
             etag=find_header(response.headers, "ETag"),
         )
-    logger.info("done", extra={"context": {"kind": handler.kind, "links": len(in_scope_links)}})
+
+    context: dict[str, object] = {"outcome": "done", "kind": handler.kind, "links": len(in_scope_links)}
+    if previous_hash is not None:  # only a revisit has a hash to compare against
+        context["hash_changed"] = previous_hash != content_hash
+    return context
 
 
 async def _persist_failure(
     pool: asyncpg.Pool, claimed: frontier.ClaimedUrl, result: FetchResult, config: Config
-) -> None:
+) -> dict[str, object]:
     assert result.error_kind is not None
     headers = result.response.headers if result.response is not None else {}
     decision = next_attempt(
@@ -116,7 +123,8 @@ async def _persist_failure(
     )
     async with pool.acquire() as conn, conn.transaction():
         await frontier.mark_failed(conn, claimed.id, claimed.lease_token, decision, result.error_kind)
-    logger.info(f"failed: {result.error_kind.value}")
+    outcome = "failed" if isinstance(decision, GiveUp) else "retrying"
+    return {"outcome": outcome, "error_kind": result.error_kind.value}
 
 
 async def process_one(
@@ -128,9 +136,12 @@ async def process_one(
     config: Config,
     seed_host: str,
 ) -> None:
-    """Runs one claimed url end to end. Never raises for a fetch or
-    classification outcome — those all land as a terminal write; only a
-    real bug (a database error, cancellation) propagates.
+    """Runs one claimed url end to end and logs exactly one structured
+    completion line for it, carrying `outcome` alongside the url/attempt
+    bound below and the worker_id bound by run() — never one line per
+    step. Never raises for a fetch or classification outcome — those all
+    land as a terminal write and that one line; only a real bug (a
+    database error, cancellation) propagates.
     """
     with bind(url=claimed.url, attempt=claimed.attempt_no):
         result = await _fetch(claimed, fetch_client, rate_limiter)
@@ -146,13 +157,15 @@ async def process_one(
             )
 
         if result.outcome is Outcome.SUCCESS:
-            await _persist_success(pool, claimed, result, config, seed_host)
+            context = await _persist_success(pool, claimed, result, config, seed_host)
         elif result.outcome is Outcome.NOT_MODIFIED:
             async with pool.acquire() as conn, conn.transaction():
                 await frontier.mark_unchanged(conn, claimed.id, claimed.lease_token)
-            logger.info("unchanged")
+            context = {"outcome": "unchanged"}
         else:
-            await _persist_failure(pool, claimed, result, config)
+            context = await _persist_failure(pool, claimed, result, config)
+
+        logger.info("url completed", extra={"context": context})
 
 
 async def _wait(event: asyncio.Event, timeout: float, sleep: Callable[[float], Awaitable[None]]) -> None:

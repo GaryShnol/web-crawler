@@ -7,14 +7,17 @@ wall-clock time in a test.
 """
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 
+import pytest
 from aiohttp.test_utils import TestServer
 from conftest import TEST_DATABASE_URL
 from fake_api.app import FakeResponse, create_app
 
 from crawler.config import Config
-from crawler.engine import _drain, _supervise, run
+from crawler.engine import _drain, _progress, _supervise, run
+from crawler.fetch.rate_limiter import RateLimiter
 from crawler.store import frontier
 
 
@@ -87,6 +90,57 @@ class TestSupervise:
         await asyncio.wait_for(task, timeout=5)
 
 
+class TestProgress:
+    async def test_logs_status_counts_and_the_done_delta_as_a_rate(self, pool, caplog):
+        """A gated sleep, not the instant one _supervise's tests use — that
+        lets the loop spin arbitrarily many ticks between any two awaits in
+        this test, racing ahead of the write below. Gating it means a tick
+        only ever advances when this test says so.
+        """
+        caplog.set_level(logging.INFO, logger="crawler.engine")
+        stop_claiming = asyncio.Event()
+        config = _config()
+        rate_limiter = RateLimiter(config)
+        gate = asyncio.Event()
+
+        async def _gated_sleep(_seconds: float) -> None:
+            await gate.wait()
+            gate.clear()
+
+        task = asyncio.create_task(
+            _progress(pool, rate_limiter, stop_claiming, interval=2.0, sleep=_gated_sleep)
+        )
+        await asyncio.wait_for(_wait_for_progress_lines(caplog, 1), timeout=5)  # tick 1: nothing done yet
+
+        done_id = await _insert_pending(pool, "http://fixture.local/x")
+        await _insert_pending(pool, "http://fixture.local/y")  # stays pending
+        async with pool.acquire() as conn:
+            [claimed] = await frontier.claim_batch(conn, 1, config)
+            assert claimed.id == done_id
+            await frontier.mark_done(
+                conn,
+                done_id,
+                claimed.lease_token,
+                content_type=None,
+                content_length=None,
+                content_hash=None,
+                etag=None,
+            )
+
+        gate.set()  # release tick 1's wait; the write above already landed
+        await asyncio.wait_for(_wait_for_progress_lines(caplog, 2), timeout=5)  # tick 2: one done
+        stop_claiming.set()
+        gate.set()  # release tick 2's wait so the loop can see stop_claiming and exit
+        await asyncio.wait_for(task, timeout=5)
+
+        lines = [r for r in caplog.records if r.getMessage() == "progress"]
+        assert lines[0].context["done"] == 0
+        assert lines[1].context["done"] == 1
+        assert lines[1].context["pending"] == 1
+        assert "0.5/s" in lines[1].context["rate"]  # (1 - 0) done over interval=2.0
+        assert f"limit {rate_limiter.current_rate:.1f}/s" in lines[1].context["rate"]
+
+
 class TestDrain:
     async def test_returns_once_every_task_finishes_on_its_own(self):
         gates = [asyncio.Event() for _ in range(2)]
@@ -157,6 +211,11 @@ class TestRunEndToEnd:
         row = await pool.fetchrow("SELECT status FROM urls WHERE normalized_url = $1", seed)
         assert row["status"] == "done"
 
+    async def test_a_missing_seed_url_is_rejected_before_touching_the_pool(self):
+        config = Config(database_url=TEST_DATABASE_URL, fetch_api_url="http://unused/unused")
+        with pytest.raises(ValueError, match="seed_url"):
+            await run(config)
+
 
 def _config() -> Config:
     return Config(
@@ -172,4 +231,9 @@ async def _status(pool, url_id: int) -> str:
 
 async def _wait_until(getter, expected) -> None:
     while await getter() != expected:
+        await asyncio.sleep(0)
+
+
+async def _wait_for_progress_lines(caplog, count: int) -> None:
+    while len([r for r in caplog.records if r.getMessage() == "progress"]) < count:
         await asyncio.sleep(0)

@@ -1,0 +1,55 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: crawler
+      POSTGRES_DB: crawler
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d crawler"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  fake-api:
+    build:
+      context: .
+      target: fake-api
+    healthcheck:
+      # No curl in python:3.12-slim; the interpreter that's already there
+      # doubles as the http client rather than pulling one in for this.
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=2)",
+        ]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    ports:
+      - "8080:8080" # optional: poke it by hand while it's running
+
+  crawler:
+    build:
+      context: .
+      target: crawler
+    depends_on:
+      db:
+        condition: service_healthy
+      fake-api:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:crawler@db:5432/crawler
+      # fake-api:8080 is the real network address; fixture.local is the
+      # fictional host the fixture's routes are keyed by -- app.py never
+      # actually dials it, only string-matches the ?url= it's handed. The
+      # crawl's seed has to be the latter, or every fetch 404s.
+      FETCH_API_URL: http://fake-api:8080/fetch
+    command: ["crawl", "http://fixture.local/"]
+    volumes:
+      - crawl-output:/app/output
+
+volumes:
+  crawl-output:

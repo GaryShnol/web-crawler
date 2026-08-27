@@ -8,7 +8,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Config(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
-    seed_url: str
+    # None only ever reaches run(), which requires it before crawling --
+    # `stats` never touches config.seed_url, so it has nothing to fake.
+    seed_url: str | None = None
     database_url: str
     fetch_api_url: str
 
@@ -27,6 +29,7 @@ class Config(BaseSettings):
     lease_recovery_interval_seconds: float | None = None
     poll_interval_seconds: float = 1.0
     shutdown_grace_seconds: float = 30.0
+    progress_interval_seconds: float = 10.0
 
     rate_limit_min_rps: float = 0.5
     rate_limit_decrease_factor: float = 0.5

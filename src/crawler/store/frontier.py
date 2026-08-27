@@ -155,6 +155,16 @@ async def crawl_complete(conn: asyncpg.Connection) -> bool:
     return row["complete"]
 
 
+async def status_counts(conn: asyncpg.Connection) -> dict[str, int]:
+    """Every status currently present in `urls`, with its row count. A
+    status nothing has reached yet just doesn't appear — a caller that
+    needs a fixed set (engine.py's progress line, `crawler stats`)
+    defaults the ones it asks for.
+    """
+    rows = await conn.fetch("SELECT status, count(*) FROM urls GROUP BY status")
+    return {r["status"]: r["count"] for r in rows}
+
+
 async def mark_done(
     conn: asyncpg.Connection,
     url_id: int,
@@ -164,17 +174,48 @@ async def mark_done(
     content_length: int | None,
     content_hash: str | None,
     etag: str | None,
-) -> None:
-    """Records what landed. Whether `content_hash` matches a prior visit is
-    the caller's comparison to make first; this only writes the result.
+) -> str | None:
+    """Records what landed, and returns the row's own `content_hash` from
+    immediately before this write — `None` on a url's first successful
+    fetch, the prior hash on a revisit. The caller uses that to tell a
+    first fetch from a revisit, and (comparing it to `content_hash`) an
+    unchanged revisit from a changed one, entirely from this return value
+    — no second query.
+
+    `content_changed_at` moves to now() in the same statement, exactly
+    when that prior hash is non-null and differs from the new one. A CTE
+    reads the pre-update row once; the UPDATE's own SET could compare
+    against it unqualified without one (Postgres evaluates SET against the
+    pre-update row), but RETURNING only ever sees the row after — so
+    getting the prior hash *out* needs the CTE regardless.
+
+    `prior` is a snapshot taken at the start of this statement, in
+    principle stale by the time the UPDATE locks the row — but that
+    window can't actually land a wrong comparison here. `content_hash` is
+    only ever written by this function, always gated on `lease_token`
+    matching, and a given token is only ever valid for one caller at a
+    time (freshly minted, once, by the claim_batch call that handed it
+    out). Nothing else can be concurrently writing `content_hash` on this
+    row under the same token while this statement runs, so the value
+    `prior` captured is still exactly what's about to be overwritten.
     """
-    result = await conn.execute(
+    row = await conn.fetchrow(
         """
+        WITH prior AS (
+            SELECT content_hash FROM urls WHERE id = $1 AND lease_token = $2
+        )
         UPDATE urls
         SET status = 'done', content_type = $3, content_length = $4,
-            content_hash = $5, etag = $6, lease_until = NULL,
-            last_seen_at = now(), updated_at = now()
-        WHERE id = $1 AND lease_token = $2
+            content_hash = $5, etag = $6,
+            content_changed_at = CASE
+                WHEN prior.content_hash IS NOT NULL AND prior.content_hash IS DISTINCT FROM $5
+                    THEN now()
+                ELSE urls.content_changed_at
+            END,
+            lease_until = NULL, last_seen_at = now(), updated_at = now()
+        FROM prior
+        WHERE urls.id = $1 AND urls.lease_token = $2
+        RETURNING prior.content_hash AS previous_hash
         """,
         url_id,
         lease_token,
@@ -183,7 +224,10 @@ async def mark_done(
         content_hash,
         etag,
     )
-    _warn_if_lost_race(result, url_id, "mark_done")
+    if row is None:
+        logger.warning(f"mark_done: lease race lost, no row updated (url_id={url_id})")
+        return None
+    return row["previous_hash"]
 
 
 async def mark_unchanged(conn: asyncpg.Connection, url_id: int, lease_token: uuid.UUID) -> None:

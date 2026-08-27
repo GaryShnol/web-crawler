@@ -58,6 +58,30 @@ async def _supervise(
         await _wait(stop_claiming, interval, sleep)
 
 
+async def _progress(
+    pool: asyncpg.Pool,
+    rate_limiter: RateLimiter,
+    stop_claiming: asyncio.Event,
+    interval: float,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    """Logs the done/pending/in_progress/failed counts and the measured
+    rate against the permitted one every `interval` -- measured is done's
+    delta since the last tick, over `interval`; the frontier already
+    counts that, nothing new to track.
+    """
+    last_done = 0
+    while not stop_claiming.is_set():
+        async with pool.acquire() as conn:
+            counts = await frontier.status_counts(conn)
+        done = counts.get("done", 0)
+        measured, last_done = (done - last_done) / interval, done
+        rate = f"{measured:.1f}/s (limit {rate_limiter.current_rate:.1f}/s)"
+        stats = {s: counts.get(s, 0) for s in ("pending", "in_progress", "done", "failed")}
+        logger.info("progress", extra={"context": {**stats, "rate": rate}})
+        await _wait(stop_claiming, interval, sleep)
+
+
 async def _drain(
     tasks: list[asyncio.Task],
     force_stop: asyncio.Event,
@@ -110,6 +134,9 @@ def _install_signal_handlers(stop_claiming: asyncio.Event, force_stop: asyncio.E
 
 
 async def run(config: Config, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep) -> int:
+    if config.seed_url is None:
+        raise ValueError("seed_url is required to crawl")
+
     pool = await db.create_pool(config)
     try:
         await db.run_migrations(pool, MIGRATIONS_DIR)
@@ -139,6 +166,11 @@ async def run(config: Config, sleep: Callable[[float], Awaitable[None]] = asynci
         async with FetchClient(config) as fetch_client:
             rate_limiter = RateLimiter(config)
             supervisor = asyncio.create_task(_supervise(pool, stop_claiming, interval, sleep))
+            progress = asyncio.create_task(
+                _progress(
+                    pool, rate_limiter, stop_claiming, config.progress_interval_seconds, sleep
+                )
+            )
             workers = [
                 asyncio.create_task(
                     worker.run(
@@ -151,9 +183,10 @@ async def run(config: Config, sleep: Callable[[float], Awaitable[None]] = asynci
             await stop_claiming.wait()
             await _drain(workers, force_stop, config.shutdown_grace_seconds, sleep)
 
-            supervisor.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await supervisor
+            for task in (supervisor, progress):
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
     finally:
         await pool.close()
 

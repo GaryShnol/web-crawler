@@ -18,11 +18,38 @@ RUN uv sync --frozen --no-dev
 COPY src/ ./src/
 
 
-FROM python:3.12-slim
+# Serves tests/fake_api's fixture site over HTTP -- docker-compose's stand-in
+# for the real fetch service (CLAUDE.md: a test double, not an
+# implementation). --no-dev's venv already covers it: app.py/site.py only
+# import aiohttp, PIL, pypdf and crawler.models, all runtime deps.
+FROM python:3.12-slim AS fake-api
 
-# ffmpeg for ffprobe, used by the video handler to read duration.
+RUN groupadd -g 1000 appuser && useradd -u 1000 -g appuser -m appuser
+
+WORKDIR /app
+COPY --from=builder --chown=appuser:appuser /app/.venv ./.venv
+COPY --from=builder --chown=appuser:appuser /app/src ./src
+COPY --chown=appuser:appuser tests/fake_api ./tests/fake_api
+RUN chown appuser:appuser /app
+
+# /app/tests, not /app: fake_api is imported bare (`import fake_api`, the
+# same way pytest resolves it — tests/ has no __init__.py), not as a
+# submodule of a tests package.
+ENV PATH="/app/.venv/bin:${PATH}" \
+    PYTHONPATH="/app/src:/app/tests"
+
+USER appuser
+
+CMD ["python", "-m", "fake_api"]
+
+
+FROM python:3.12-slim AS crawler
+
+# ffmpeg for ffprobe, used by the video handler to read duration. gosu for
+# docker-entrypoint.sh -- the one place this stage still needs to act as
+# root, however briefly, is fixing up a freshly mounted volume's ownership.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends ffmpeg gosu \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd -g 1000 appuser && useradd -u 1000 -g appuser -m appuser
@@ -30,11 +57,20 @@ RUN groupadd -g 1000 appuser && useradd -u 1000 -g appuser -m appuser
 WORKDIR /app
 COPY --from=builder --chown=appuser:appuser /app/.venv ./.venv
 COPY --from=builder --chown=appuser:appuser /app/src ./src
-RUN chown appuser:appuser /app
+COPY --chown=appuser:appuser migrations/ ./migrations/
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chown appuser:appuser /app && chmod +x /usr/local/bin/docker-entrypoint.sh
 
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONPATH="/app/src"
 
-USER appuser
-
-CMD ["python", "-m", "crawler.cli"]
+# No USER here -- docker-entrypoint.sh starts as root (needed to chown a
+# freshly mounted volume, which a build-time chown can never reach: the
+# mount happens at container start, after the image's own chown, and
+# always wins) and gosu drops to appuser before exec'ing the real process.
+#
+# ENTRYPOINT, not CMD: `docker compose run crawler stats` (or `crawl
+# <seed>`) has to append an argument to this, not replace the whole
+# command -- CMD would be replaced wholesale and try to exec a binary
+# literally named "stats".
+ENTRYPOINT ["docker-entrypoint.sh"]
