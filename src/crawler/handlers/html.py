@@ -30,11 +30,12 @@ def _looks_like_html(body: bytes) -> bool:
     return any(marker in head for marker in _SNIFF_MARKERS)
 
 
-@register("text/html")
+@register
 class HtmlHandler(Handler):
     kind = "page"
     directory = "pages"
     extension = "html"
+    content_type = "text/html"
 
     def sniff(self, body: bytes) -> bool:
         return _looks_like_html(body)

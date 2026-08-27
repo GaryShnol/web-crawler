@@ -12,13 +12,21 @@ import asyncpg
 async def insert_content(
     conn: asyncpg.Connection,
     content_hash: str,
-    content_type: str | None,
+    content_type: str,
     byte_size: int,
     storage_path: str,
 ) -> None:
     """Registers a blob's hash the first time it's seen. `DO NOTHING` on a
     repeat: identical bytes from a second url are already on disk under
     this hash — see store/blobs.py — so there's nothing new to record.
+
+    `content_type` is always the matched handler's own canonical type
+    (`Handler.content_type`, e.g. "text/html"), never the raw response
+    header — that header can be absent or carry parameters a handler's
+    sniff already looked past, and `contents.content_type` is `NOT NULL`.
+    The raw header, `None` included, lands on `urls.content_type` instead
+    (store/frontier.py's mark_done/mark_skipped), which is nullable for
+    exactly that reason.
     """
     await conn.execute(
         """

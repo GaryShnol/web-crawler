@@ -1,22 +1,10 @@
-"""Tests for src/crawler/models.py's header and body codecs."""
+"""Tests for src/crawler/models.py's Retry-After parsing."""
 
 from datetime import UTC, datetime
 
-from crawler.models import decode_body, encode_body, parse_retry_after
+from crawler.models import parse_retry_after
 
 _NOW = datetime(2026, 1, 1, tzinfo=UTC)
-
-
-class TestBodyCodec:
-    def test_round_trips_bytes(self):
-        assert decode_body(encode_body(b"hello")) == b"hello"
-
-    def test_none_stays_none(self):
-        assert encode_body(None) is None
-        assert decode_body(None) is None
-
-    def test_empty_bytes_round_trip_not_none(self):
-        assert decode_body(encode_body(b"")) == b""
 
 
 class TestParseRetryAfter:

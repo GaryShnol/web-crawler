@@ -6,7 +6,6 @@ and one `@register` decorator here, with no edit to worker.py or to any
 other handler.
 """
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -33,14 +32,19 @@ class Handler(Protocol):
 
     `kind` names the family for `content_metadata.kind` (e.g. "page").
     `directory`/`extension` name where a matched body's blob lands under
-    `output_dir` — see CLAUDE.md's blob-naming decision. Both come from the
-    handler that matched, never from the URL, because the handler is what
-    verified the content actually is what it claims to be.
+    `output_dir` — see CLAUDE.md's blob-naming decision. `content_type` is
+    the one canonical string for the family (e.g. "text/html", never a
+    variant carrying `; charset=...`) — what a matched body's `contents` row
+    stores, regardless of whatever the response's own Content-Type header
+    said. All four come from the handler that matched, never from the URL
+    or the header, because the handler is what verified the content
+    actually is what it claims to be.
     """
 
     kind: str
     directory: str
     extension: str
+    content_type: str
 
     def sniff(self, body: bytes) -> bool:
         """True if `body`'s own bytes are this handler's type — magic bytes,
@@ -56,19 +60,16 @@ class Handler(Protocol):
 _REGISTRY: dict[str, Handler] = {}
 
 
-def register(content_type: str) -> Callable[[type[Handler]], type[Handler]]:
-    """Decorator: `@register("text/html")` on a handler class registers one
-    instance of it, filed under the Content-Type it's normally declared
-    with. That filing is only a hint for `resolve` below to try first —
-    the real routing decision is always `sniff`, since a declared
-    Content-Type is exactly the thing that can lie.
+def register(cls: type[Handler]) -> type[Handler]:
+    """Decorator: `@register` on a handler class files one instance of it
+    under its own declared `content_type` — one string, declared once, in
+    the class body next to `kind`/`directory`/`extension`. That filing is
+    only a hint for `resolve` below to try first — the real routing
+    decision is always `sniff`, since a declared Content-Type is exactly
+    the thing that can lie.
     """
-
-    def decorator(cls: type[Handler]) -> type[Handler]:
-        _REGISTRY[content_type] = cls()
-        return cls
-
-    return decorator
+    _REGISTRY[cls.content_type] = cls()
+    return cls
 
 
 def resolve(content_type: str | None, body: bytes) -> Handler | None:
@@ -76,7 +77,11 @@ def resolve(content_type: str | None, body: bytes) -> Handler | None:
     matches — the "skipped" case (DESIGN.md). Trusts `content_type` only as
     a hint about which handler to try first; every registered handler's
     `sniff` gets a chance regardless, so a mislabeled body still lands on
-    the handler its bytes actually match.
+    the handler its bytes actually match. The `.split(";", 1)` below only
+    steers that hint lookup — what a matched handler reports back through
+    its own `.content_type` is always the bare literal declared on the
+    class, so a header carrying `; charset=...` (or no header at all) never
+    reaches `contents.content_type` either way.
     """
     hint = _REGISTRY.get(content_type.split(";", 1)[0].strip().lower()) if content_type else None
     if hint is not None and hint.sniff(body):

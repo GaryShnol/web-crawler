@@ -25,10 +25,7 @@ rather than output I accepted.
 
 Before delivery, a separate session with none of the build context was pointed
 at the repo and asked to find reasons to reject it rather than defend it
-(`10-adversarial-review.md`). Two defects it did not find — a CRLF entrypoint
-and a drain check sharing lease recovery's timer — were invisible to 204
-passing tests and appeared only under `docker compose up`. That command is now
-something I run, not something I claim.
+(`10-adversarial-review.md`).
 
 ## Notable rejections
 
@@ -87,6 +84,30 @@ something I run, not something I claim.
     transaction."** That invariant is what makes the drain check race-free
     without a lock, so it is worth stating — as a sentence where someone would
     break it, not as lint machinery guarding one call site.
+
+## What the tests didn't catch
+
+Three defects reached the end of the build with the suite green.
+
+`docker-entrypoint.sh` was checked out with CRLF, so Linux looked for an
+interpreter named `/bin/sh\r`; the container exited 255 before any Python ran.
+Drain detection rode lease recovery's 60s interval, so a crawl that finished
+nine urls in two seconds took another sixty to exit — correct, and
+indistinguishable from a hang to anyone watching. Both surfaced the first time
+`docker compose up` was treated as something to run rather than something to
+claim.
+
+The third was structural. `site.build_routes()`'s fixture graph had existed
+since feature 1, referenced by a link-resolution smoke test and by handler unit
+tests calling into it directly — but every end-to-end test in `test_engine.py`
+built its own single-url route dict rather than crawling the graph. A response
+class that has to be *reachable from the seed page* to matter therefore had no
+test that would ever drive it. `test_full_fixture_graph_crawls_clean` is the
+first crawl over the whole graph, and it caught `contents.content_type NOT NULL`
+on a header-less body that `sniff` matched anyway — a path no unit test calling
+`insert_content` directly could reach. The remaining gaps (a redirect, the 4xx
+and 5xx routes, a malformed envelope) land the same way: a route, a link from
+the seed page, an assertion in that test.
 
 ## Where I was wrong
 

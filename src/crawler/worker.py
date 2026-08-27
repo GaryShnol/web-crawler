@@ -116,7 +116,7 @@ async def _persist_success(
 
     async with pool.acquire() as conn, conn.transaction():
         await metadata.insert_content(
-            conn, content_hash, content_type, len(response.body), storage_path
+            conn, content_hash, handler.content_type, len(response.body), storage_path
         )
         if handled.metadata is not None:
             await metadata.insert_metadata(conn, content_hash, handler.kind, handled.metadata)

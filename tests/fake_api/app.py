@@ -1,8 +1,8 @@
 """In-process test double for the fetch API — not an implementation of the
 service, see CLAUDE.md. GET /fetch?url=<encoded> returns a JSON envelope
-{statusCode, headers, body}, body encoded via crawler.models.encode_body (the
-same assumed encoding fetch/client.py decodes with — see DESIGN.md for why
-it's an assumption). A route is a response *sequence*: call N for a URL
+{statusCode, headers, body}, body base64-encoded (the same assumed encoding
+fetch/client.py decodes with directly — see DESIGN.md for why it's an
+assumption). A route is a response *sequence*: call N for a URL
 returns routes[url][min(N, len-1)], so the last entry sticks once exhausted.
 Fresh app per test — no reset endpoint.
 
@@ -20,13 +20,12 @@ can poll it without corrupting what a crawl actually sees.
 """
 
 import asyncio
+import base64
 import os
 import random
 from typing import NamedTuple
 
 from aiohttp import web
-
-from crawler.models import encode_body
 
 _FAULT_KINDS = ("429_retry_after", "429", "500", "403", "slow")
 
@@ -50,11 +49,8 @@ def _fault_response(kind: str, rng: random.Random) -> FakeResponse | None:
 
 
 def _envelope(resp: FakeResponse) -> dict:
-    return {
-        "statusCode": resp.status_code,
-        "headers": resp.headers,
-        "body": encode_body(resp.body),
-    }
+    body = base64.b64encode(resp.body).decode() if resp.body is not None else None
+    return {"statusCode": resp.status_code, "headers": resp.headers, "body": body}
 
 
 def create_app(

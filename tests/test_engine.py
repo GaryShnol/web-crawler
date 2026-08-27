@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 import pytest
 from aiohttp.test_utils import TestServer
 from conftest import TEST_DATABASE_URL
+from fake_api import site
 from fake_api.app import FakeResponse, create_app
 
 from crawler.config import Config
@@ -354,6 +355,40 @@ class TestRunEndToEnd:
         assert lines[0].context["reason"] == "drain"
         assert lines[0].context["done"] == 1
         assert lines[0].context["pending"] == 0
+
+    async def test_full_fixture_graph_crawls_clean(self, pool, tmp_path):
+        """site.py's own graph, actually driven through engine.run() rather
+        than just asserted to exist (test_fake_api.py's job) or fed to a
+        handler directly (test_handlers_*.py's). This is what catches a
+        response the write path can't handle -- MISSING_CONTENT_TYPE's
+        sniff-only match, no Content-Type header at all -- reaching
+        insert_content and hitting contents.content_type NOT NULL, which no
+        unit test calling insert_content directly would ever have driven.
+        """
+        routes = site.build_routes()
+        async with _running(routes) as server:
+            config = Config(
+                seed_url=site.SEED,
+                database_url=TEST_DATABASE_URL,
+                fetch_api_url=str(server.make_url("/fetch")),
+                output_dir=tmp_path,
+                max_concurrency=4,
+            )
+            exit_code = await asyncio.wait_for(run(config, sleep=_instant_sleep), timeout=15)
+
+        assert exit_code == 0
+
+        row = await pool.fetchrow(
+            "SELECT status, content_type, content_hash FROM urls WHERE normalized_url = $1",
+            site.MISSING_CONTENT_TYPE,
+        )
+        assert row["status"] == "done"
+        assert row["content_type"] is None  # the header that was actually sent: none
+
+        stored_type = await pool.fetchval(
+            "SELECT content_type FROM contents WHERE content_hash = $1", row["content_hash"]
+        )
+        assert stored_type == "image/png"  # ImageHandler's own canonical type, from sniff alone
 
     async def test_a_missing_seed_url_is_rejected_before_touching_the_pool(self):
         config = Config(database_url=TEST_DATABASE_URL, fetch_api_url="http://unused/unused")

@@ -103,17 +103,25 @@ and its findings are being worked through.
   indistinguishable from a hang to anyone watching it. Neither of the two
   suspects previously recorded here, pool exhaustion and rate-limiter
   starvation, was involved in either.
-- **Open review findings.** `contents.content_type` is `NOT NULL` while the
-  write path can hand it `None` for a response with no `Content-Type`
-  header. `Location` is captured onto `FetchResult.resolved_url` and never
-  read, so a redirect is classified as a transient failure and burns its
-  whole retry budget against the same 3xx. `encode_body`/`decode_body` are a
-  two-line wrapper with one production call site.
+- **Open review finding.** `Location` is captured onto
+  `FetchResult.resolved_url` and never read, so a redirect is classified as
+  a transient failure and burns its whole retry budget against the same
+  3xx. Design questions raised, not yet answered: whether the fix should be
+  scoped to 3xx specifically (new `ErrorKind.REDIRECT`, `PERMANENT_FAILURE`,
+  `Location` folded into `error_message`) versus the broader "any
+  off-contract status defaults to `TEMPORARY_FAILURE`" pattern, and whether
+  `FetchResult.resolved_url` survives that fix or is removed as the same
+  one-write-site dead field `encode_body`/`decode_body` turned out to be.
 - **`tests/fake_api/` only generates responses the code handles well.**
-  Nothing reachable from the seed page returns 404, 403, 429, 500, a missing
-  `Content-Type`, a redirect, or a malformed envelope, so no crawl has ever
-  traversed a failure end to end. Every missing fixture sits on the far side
-  of an `except` clause or a status branch nothing has driven.
+  Nothing reachable from the seed page returns 404, 403, 429, 500, a
+  redirect, or a malformed envelope, so no crawl has ever traversed a
+  failure end to end. Every missing fixture sits on the far side of an
+  `except` clause or a status branch nothing has driven. (A missing
+  `Content-Type` is covered now — `site.py`'s `MISSING_CONTENT_TYPE`,
+  driven end to end by `test_engine.py`'s
+  `test_full_fixture_graph_crawls_clean`, which is also the first test to
+  run `engine.run()` over `site.build_routes()`'s whole graph at all rather
+  than an ad-hoc single-URL route dict.)
 - **There is no `README.md`.** The two-run change-detection table below is
   meant to land in it, not stand alone.
 - **`handlers/html.py` still doesn't honour `<base href>`.** Resolution
@@ -132,7 +140,7 @@ above, then a `README.md`, then the worklog and delivery.
 models.py    Outcome, FetchResponse(status_code, headers, body),
              FetchResult(outcome, elapsed, resolved_url, response,
                          error_kind=None, error_detail=None),
-             find_header, parse_retry_after, encode_body/decode_body
+             find_header, parse_retry_after
 errors.py    ErrorKind (incl. internal_error), Classification(outcome,
              error_kind, detail=None), classify(response, prev_etag=None),
              classify_oversized_body(max_body_bytes, bytes_read),
@@ -190,8 +198,10 @@ store/blobs.py
              write(output_dir, directory, extension, url, body)
                  -> (content_hash, storage_path)
 store/metadata.py
-             insert_content(conn, content_hash, content_type, byte_size,
+             insert_content(conn, content_hash, content_type: str, byte_size,
                             storage_path)
+                 content_type is always the matched handler's own
+                 canonical type, never the raw response header
              insert_metadata(conn, content_hash, kind, payload)
 store/stats.py   read-only, nothing in the live crawl calls it
              Stats(status_counts, failure_reasons, attempts_total,
@@ -201,9 +211,15 @@ store/stats.py   read-only, nothing in the live crawl calls it
 
 handlers/base.py
              HandlerResult(metadata: dict | None, links: list[DiscoveredLink])
-             Handler protocol: kind, directory, extension, sniff(body),
-                               handle(body, url) -> HandlerResult
-             register(content_type), resolve(content_type, body) -> Handler | None
+             Handler protocol: kind, directory, extension, content_type,
+                               sniff(body), handle(body, url) -> HandlerResult
+                 content_type is the one canonical string for the family
+                 (e.g. "text/html") — declared once on the class, next to
+                 kind/directory/extension, and what a matched body's
+                 contents row stores. Never the raw response header.
+             register(cls) -> cls  -- @register, no argument; keys _REGISTRY
+                               off cls.content_type
+             resolve(content_type, body) -> Handler | None
 handlers/html.py   HtmlHandler "text/html" — kind "page", dir "pages", ext "html"
                    links: a[href] (is_asset=False) plus img/video/source/embed
                    src (is_asset=True); metadata {title, link_count} over all

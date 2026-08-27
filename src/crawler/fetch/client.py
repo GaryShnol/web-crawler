@@ -5,6 +5,7 @@ ask about. Retries, rate limiting, and the frontier are someone else's job;
 this is url in, `FetchResult` out.
 """
 
+import base64
 import json
 import math
 import time
@@ -14,7 +15,7 @@ import aiohttp
 
 from ..config import Config
 from ..errors import classify, classify_exception, classify_oversized_body
-from ..models import FetchResponse, FetchResult, decode_body, find_header
+from ..models import FetchResponse, FetchResult, find_header
 
 _BASE64_GROUP = 4  # base64 emits 4 output bytes per 3 input bytes
 _ENVELOPE_OVERHEAD_BYTES = 8192  # room for statusCode, headers, and JSON punctuation
@@ -113,7 +114,11 @@ class FetchClient:
         elapsed = time.monotonic() - started
 
         envelope = json.loads(raw)
-        body = decode_body(envelope.get("body"))
+        encoded_body = envelope.get("body")
+        # Assumed wire encoding for a `Buffer | null` body -- the real API's
+        # own encoding is unverifiable (see DESIGN.md), so this is a guess:
+        # base64, or null.
+        body = base64.b64decode(encoded_body) if encoded_body is not None else None
 
         response = FetchResponse(
             status_code=envelope["statusCode"], headers=envelope.get("headers") or {}, body=body
