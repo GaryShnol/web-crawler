@@ -23,6 +23,13 @@ One session per step, seeded from `CLAUDE.md` and ending with a
 single briefs, so the decisions show up in the transcripts as positions I argued
 rather than output I accepted.
 
+Before delivery, a separate session with none of the build context was pointed
+at the repo and asked to find reasons to reject it rather than defend it
+(`10-adversarial-review.md`). Two defects it did not find — a CRLF entrypoint
+and a drain check sharing lease recovery's timer — were invisible to 204
+passing tests and appeared only under `docker compose up`. That command is now
+something I run, not something I claim.
+
 ## Notable rejections
 
 1. **`enqueue_many` as a single `WITH` query.** Under Read Committed both
@@ -63,6 +70,24 @@ rather than output I accepted.
    `store/frontier.py` takes a `Connection`; the pool stays at `engine.py` and
    `cli.py`.
 
+8. **A code change for the window between a committed claim and the worker
+   resuming.** Raised in review as a lost lease. Every pairing of a database
+   write with in-process state has that window and `SIGKILL` has it regardless;
+   the lease is what bounds it. What was actually wrong was an `engine.py`
+   docstring promising an unconditional release. The docstring changed, the
+   code didn't.
+
+9. **`error_message` assembled in the persist layer.** Switching on
+   `error_kind` in `worker.py` to rebuild a string the classifier already held
+   adds one special case per kind. An optional `detail` on `Classification`,
+   filled only where the numbers or the caught exception live, leaves all three
+   `mark_failed` call sites identical.
+
+10. **A static check enforcing "every `enqueue_many` runs inside the persist
+    transaction."** That invariant is what makes the drain check race-free
+    without a lock, so it is worth stating — as a sentence where someone would
+    break it, not as lint machinery guarding one call site.
+
 ## Where I was wrong
 
 I challenged the claim that `INSERT ... ON CONFLICT DO NOTHING` raises a
@@ -70,6 +95,15 @@ serialization failure under `REPEATABLE READ`, citing a documentation paraphrase
 saying such an insert simply does not proceed. The position was held rather than
 conceded, the interleaving re-run with exception introspection, and it returned
 SQLSTATE `40001` deterministically. I took the correction.
+
+I also reported the crawler hanging once the frontier drained, and called it the
+most severe finding open: nothing set `stop_claiming` on an empty frontier.
+Reproduction disproved it. `docker compose up --abort-on-container-exit`
+self-terminated at exit 0, and `_supervise` had been setting the event all
+along. The real defect sat next to the one I claimed: drain detection rode lease
+recovery's 60s interval, so a crawl that finished in two seconds took
+sixty-nine to exit. The fix was a second interval, not the mechanism I said was
+missing.
 
 ## Transcripts
 

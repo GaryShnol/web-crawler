@@ -69,7 +69,9 @@ class TestSuccess:
 class TestTruncatedBody:
     def test_content_length_mismatch_is_temporary_truncated(self):
         result = classify(_response(200, {"Content-Length": "99999"}, b"short"))
-        assert result == Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.TRUNCATED_BODY)
+        assert result.outcome is Outcome.TEMPORARY_FAILURE
+        assert result.error_kind is ErrorKind.TRUNCATED_BODY
+        assert result.detail == "declared 99999 bytes, got 5"
 
 
 class TestEmptyBodyAndConditionalHit:
@@ -96,43 +98,61 @@ class TestEmptyBodyAndConditionalHit:
 
 class TestBodyTooLarge:
     def test_oversized_body_is_permanent(self):
-        result = classify_oversized_body()
-        assert result == Classification(Outcome.PERMANENT_FAILURE, ErrorKind.BODY_TOO_LARGE)
+        result = classify_oversized_body(max_body_bytes=100, bytes_read=8500)
+        assert result.outcome is Outcome.PERMANENT_FAILURE
+        assert result.error_kind is ErrorKind.BODY_TOO_LARGE
+        assert result.detail == "exceeded max_body_bytes=100 (read at least 8500 bytes)"
 
 
 class TestUnparseableContent:
     def test_unparseable_content_is_temporary(self):
         # unlike an oversized body, a retry isn't guaranteed to see the same
         # broken bytes — the fetch API can return something different next time.
-        result = classify_unparseable_content()
-        assert result == Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.UNPARSEABLE_CONTENT)
+        result = classify_unparseable_content(ValueError("bad chunk stream"))
+        assert result.outcome is Outcome.TEMPORARY_FAILURE
+        assert result.error_kind is ErrorKind.UNPARSEABLE_CONTENT
+        assert result.detail == "ValueError: bad chunk stream"
 
 
 class TestClassifyException:
     def test_timeout_is_temporary(self):
         result = classify_exception(TimeoutError())
-        assert result == Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.TIMEOUT)
+        assert result.outcome is Outcome.TEMPORARY_FAILURE
+        assert result.error_kind is ErrorKind.TIMEOUT
 
     def test_connection_error_is_temporary(self):
         result = classify_exception(aiohttp.ClientConnectionError())
-        assert result == Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.CONNECTION_ERROR)
+        assert result.outcome is Outcome.TEMPORARY_FAILURE
+        assert result.error_kind is ErrorKind.CONNECTION_ERROR
 
     def test_payload_error_is_temporary_connection_error(self):
         # a body that dies mid-stream is the transport failing, not a status
         # the service returned — grouped with ClientConnectionError.
         result = classify_exception(aiohttp.ClientPayloadError())
-        assert result == Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.CONNECTION_ERROR)
+        assert result.outcome is Outcome.TEMPORARY_FAILURE
+        assert result.error_kind is ErrorKind.CONNECTION_ERROR
 
     def test_connection_error_subclass_is_temporary(self):
         # ClientOSError is what aiohttp actually raises on a reset connection.
         result = classify_exception(aiohttp.ClientOSError())
-        assert result == Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.CONNECTION_ERROR)
+        assert result.outcome is Outcome.TEMPORARY_FAILURE
+        assert result.error_kind is ErrorKind.CONNECTION_ERROR
 
     def test_server_timeout_error_is_timeout_not_connection_error(self):
         # ServerTimeoutError subclasses both TimeoutError and
         # ClientConnectionError — the timeout check must win.
         result = classify_exception(aiohttp.ServerTimeoutError())
-        assert result == Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.TIMEOUT)
+        assert result.outcome is Outcome.TEMPORARY_FAILURE
+        assert result.error_kind is ErrorKind.TIMEOUT
+
+    def test_detail_distinguishes_connect_from_read_timeout(self):
+        # Both subclass ServerTimeoutError/TimeoutError identically for
+        # classification purposes -- detail is the only place connect vs.
+        # read survives, via the exception's own class name.
+        connect = classify_exception(aiohttp.ConnectionTimeoutError())
+        read = classify_exception(aiohttp.SocketTimeoutError())
+        assert "ConnectionTimeoutError" in connect.detail
+        assert "SocketTimeoutError" in read.detail
 
     def test_unrelated_exception_is_reraised_not_swallowed(self):
         with pytest.raises(TypeError):

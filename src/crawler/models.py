@@ -108,6 +108,9 @@ class FetchResult:
     and it's the one thing a caller recording a failure (store/frontier.py's
     mark_failed, which requires it) can't safely re-derive — a `response`-less
     result (timeout, oversized body) has nothing left to reclassify from.
+    `error_detail` is the same carry-through for `Classification.detail`
+    (see DESIGN.md) — the specifics (declared vs. actual bytes, the cap
+    that tripped, connect vs. read) live only where they were computed.
     """
 
     outcome: Outcome
@@ -115,3 +118,4 @@ class FetchResult:
     resolved_url: str | None
     response: FetchResponse | None
     error_kind: "ErrorKind | None" = None
+    error_detail: str | None = None

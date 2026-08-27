@@ -20,12 +20,19 @@ _BASE64_GROUP = 4  # base64 emits 4 output bytes per 3 input bytes
 _ENVELOPE_OVERHEAD_BYTES = 8192  # room for statusCode, headers, and JSON punctuation
 
 
-async def _read_capped(http_response: aiohttp.ClientResponse, max_body_bytes: int) -> bytes | None:
+class _BodyTooLarge(Exception):
+    """Signals the cap trip out of _read_capped with the numbers classify_oversized_body needs."""
+
+    def __init__(self, bytes_read: int) -> None:
+        self.bytes_read = bytes_read
+
+
+async def _read_capped(http_response: aiohttp.ClientResponse, max_body_bytes: int) -> bytes:
     """Stream the raw response instead of buffering it whole — the point of
     the cap is to never hold more than roughly `max_body_bytes` in memory,
     and `await http_response.json()` reads the entire body first regardless
-    of what a (possibly lying) Content-Length claims. Returns None, with the
-    connection already closed, once the cap is exceeded.
+    of what a (possibly lying) Content-Length claims. Raises _BodyTooLarge,
+    with the connection already closed, once the cap is exceeded.
 
     The body arrives base64-encoded inside a JSON envelope, so the raw bytes
     run ~4/3 larger than the asset they encode; `_ENVELOPE_OVERHEAD_BYTES`
@@ -40,7 +47,7 @@ async def _read_capped(http_response: aiohttp.ClientResponse, max_body_bytes: in
         total += len(chunk)
         if total > cap:
             http_response.close()
-            return None
+            raise _BodyTooLarge(total)
         chunks.append(chunk)
     return b"".join(chunks)
 
@@ -82,6 +89,16 @@ class FetchClient:
                 self._config.fetch_api_url, params={"url": url}, headers=headers
             ) as http_response:
                 raw = await _read_capped(http_response, self._config.max_body_bytes)
+        except _BodyTooLarge as exc:
+            classification = classify_oversized_body(self._config.max_body_bytes, exc.bytes_read)
+            return FetchResult(
+                outcome=classification.outcome,
+                elapsed=time.monotonic() - started,
+                resolved_url=None,
+                response=None,
+                error_kind=classification.error_kind,
+                error_detail=classification.detail,
+            )
         except (TimeoutError, aiohttp.ClientConnectionError, aiohttp.ClientPayloadError) as exc:
             classification = classify_exception(exc)
             return FetchResult(
@@ -90,19 +107,10 @@ class FetchClient:
                 resolved_url=None,
                 response=None,
                 error_kind=classification.error_kind,
+                error_detail=classification.detail,
             )
 
         elapsed = time.monotonic() - started
-
-        if raw is None:
-            classification = classify_oversized_body()
-            return FetchResult(
-                outcome=classification.outcome,
-                elapsed=elapsed,
-                resolved_url=None,
-                response=None,
-                error_kind=classification.error_kind,
-            )
 
         envelope = json.loads(raw)
         body = decode_body(envelope.get("body"))
@@ -118,4 +126,5 @@ class FetchClient:
             resolved_url=find_header(response.headers, "Location"),
             response=response,
             error_kind=classification.error_kind,
+            error_detail=classification.detail,
         )

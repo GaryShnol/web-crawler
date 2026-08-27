@@ -152,6 +152,7 @@ class TestBodyTooLarge:
         assert result.outcome == Outcome.PERMANENT_FAILURE
         # aborted mid-stream: no complete envelope to pull status/headers from
         assert result.response is None
+        assert "max_body_bytes=100" in result.error_detail
 
     async def test_body_within_the_cap_is_untouched(self):
         routes = {"u": [FakeResponse(200, {}, b"x" * 50)]}
@@ -176,6 +177,7 @@ class TestTransportFailures:
 
         assert result.outcome == Outcome.TEMPORARY_FAILURE
         assert result.response is None
+        assert result.error_detail is not None  # the refused-connection exception's own repr
 
 
 class TestUsageOutsideContextManager:

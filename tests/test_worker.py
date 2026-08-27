@@ -176,6 +176,7 @@ class TestUnparseableContent:
         row = await _row(pool, url_id)
         assert row["status"] == "pending"  # temporary failure: retried, not given up on
         assert row["error_kind"] == "unparseable_content"
+        assert row["error_message"] is not None  # the handler exception's own repr, not rebuilt
         assert row["content_hash"] is None  # handler.handle() raised before blobs.write ran
         assert row["next_attempt_at"] is not None
 
@@ -226,3 +227,27 @@ class TestNotModified:
         row = await _row(pool, url_id)
         assert row["status"] == "done"
         assert row["last_seen_at"] is not None
+
+
+class TestInternalError:
+    async def test_unhandled_exception_is_contained_and_recorded(self, pool, tmp_path, monkeypatch):
+        # _fetch raising is a stand-in for any bug reaching process_one's
+        # outer boundary uncaught -- json.loads in fetch/client.py, a bad
+        # header lookup, anything. process_one returning at all (rather
+        # than this test erroring out on a propagated ValueError) is the
+        # containment claim; the row below is the recording claim.
+        page = "http://fixture.local/boom"
+        routes = {page: [FakeResponse(200, {"Content-Type": "text/html"}, b"<html></html>")]}
+
+        async def _raise(*_args, **_kwargs):
+            raise ValueError("boom")
+
+        monkeypatch.setattr("crawler.worker._fetch", _raise)
+
+        url_id, _ = await _process(pool, page, routes, tmp_path, max_attempts=5)
+
+        row = await _row(pool, url_id)
+        assert row["status"] == "pending"  # temporary failure: retried, not buried
+        assert row["error_kind"] == "internal_error"
+        assert row["error_message"] == "ValueError: boom"
+        assert row["next_attempt_at"] is not None

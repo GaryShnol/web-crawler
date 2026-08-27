@@ -27,6 +27,11 @@ class Config(BaseSettings):
     # None means "half of lease_seconds" — a fixed literal default would
     # silently drift out of sync with a lease_seconds override.
     lease_recovery_interval_seconds: float | None = None
+    # Separate from lease recovery's cadence on purpose: noticing an empty
+    # frontier is a cheap existence check, not a lease-safety window, so it
+    # shouldn't wait on how long a lease is allowed to go stale (see
+    # DESIGN.md).
+    drain_check_interval_seconds: float = 2.0
     poll_interval_seconds: float = 1.0
     shutdown_grace_seconds: float = 30.0
     progress_interval_seconds: float = 10.0

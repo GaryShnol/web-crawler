@@ -16,7 +16,14 @@ from conftest import TEST_DATABASE_URL
 from fake_api.app import FakeResponse, create_app
 
 from crawler.config import Config
-from crawler.engine import _drain, _progress, _supervise, run
+from crawler.engine import (
+    _drain,
+    _force_shutdown_on_death,
+    _progress,
+    _supervise,
+    _watch_drain,
+    run,
+)
 from crawler.fetch.rate_limiter import RateLimiter
 from crawler.store import frontier
 
@@ -47,12 +54,63 @@ async def _running(routes: dict[str, list[FakeResponse]]):
 
 
 class TestSupervise:
-    async def test_stops_claiming_once_the_frontier_drains(self, pool):
+    async def test_recovers_an_expired_lease_along_the_way(self, pool):
+        stop_claiming = asyncio.Event()
+        url_id = await _insert_pending(pool, "http://fixture.local/y")
+        async with pool.acquire() as conn:
+            [claimed] = await frontier.claim_batch(conn, 1, _config())
+        assert claimed.id == url_id
+        await pool.execute(
+            "UPDATE urls SET lease_until = now() - interval '1 second' WHERE id = $1", url_id
+        )
+
+        task = asyncio.create_task(
+            _supervise(pool, stop_claiming, interval=999, sleep=_instant_sleep)
+        )
+        await asyncio.wait_for(_wait_until(lambda: _status(pool, url_id), "pending"), timeout=5)
+        stop_claiming.set()
+        await asyncio.wait_for(task, timeout=5)
+
+    async def test_does_not_stop_claiming_when_the_frontier_drains(self, pool):
+        # Drain detection is _watch_drain's job now, not _supervise's -- see
+        # DESIGN.md on why the two intervals had to split. This guards
+        # against the two silently getting re-coupled.
         stop_claiming = asyncio.Event()
         url_id = await _insert_pending(pool, "http://fixture.local/x")
 
         task = asyncio.create_task(
             _supervise(pool, stop_claiming, interval=999, sleep=_instant_sleep)
+        )
+        await asyncio.sleep(0)  # let the first tick run
+
+        async with pool.acquire() as conn:
+            [claimed] = await frontier.claim_batch(conn, 1, _config())
+            await frontier.mark_done(
+                conn,
+                url_id,
+                claimed.lease_token,
+                content_type=None,
+                content_length=None,
+                content_hash=None,
+                etag=None,
+            )
+        await asyncio.sleep(0)
+
+        assert not stop_claiming.is_set()  # frontier is empty; _supervise doesn't care
+        stop_claiming.set()
+        await asyncio.wait_for(task, timeout=5)
+
+
+class TestWatchDrain:
+    async def test_stops_claiming_once_the_frontier_drains(self, pool):
+        stop_claiming = asyncio.Event()
+        reasons: list[str] = []
+        url_id = await _insert_pending(pool, "http://fixture.local/x")
+
+        task = asyncio.create_task(
+            _watch_drain(
+                pool, stop_claiming, interval=999, record_reason=reasons.append, sleep=_instant_sleep
+            )
         )
         await asyncio.sleep(0)  # let the first tick run
         assert not stop_claiming.is_set()  # one pending row: not complete yet
@@ -71,8 +129,11 @@ class TestSupervise:
 
         await asyncio.wait_for(task, timeout=5)
         assert stop_claiming.is_set()
+        assert reasons == ["drain"]
 
-    async def test_recovers_an_expired_lease_along_the_way(self, pool):
+    async def test_does_not_touch_lease_recovery(self, pool):
+        # _watch_drain only ever reads; recover_expired_leases is
+        # _supervise's job, on its own (longer) interval.
         stop_claiming = asyncio.Event()
         url_id = await _insert_pending(pool, "http://fixture.local/y")
         async with pool.acquire() as conn:
@@ -83,9 +144,13 @@ class TestSupervise:
         )
 
         task = asyncio.create_task(
-            _supervise(pool, stop_claiming, interval=999, sleep=_instant_sleep)
+            _watch_drain(
+                pool, stop_claiming, interval=999, record_reason=lambda _r: None, sleep=_instant_sleep
+            )
         )
-        await asyncio.wait_for(_wait_until(lambda: _status(pool, url_id), "pending"), timeout=5)
+        await asyncio.sleep(0)
+
+        assert await _status(pool, url_id) == "in_progress"  # still leased; nothing recovered it
         stop_claiming.set()
         await asyncio.wait_for(task, timeout=5)
 
@@ -190,6 +255,63 @@ class TestDrain:
         )
         assert task.cancelled()
 
+    async def test_a_task_that_raises_is_reported_and_run_returns_true(self, caplog):
+        # Stands in for worker.run() itself breaking (a claim, a release,
+        # the pool going away) -- process_one already contains an ordinary
+        # per-url bug, so a task reaching gather() with a live exception
+        # means the worker loop broke, not one bad url.
+        caplog.set_level(logging.ERROR, logger="crawler.engine")
+
+        async def boom() -> None:
+            raise ValueError("worker broke")
+
+        task = asyncio.create_task(boom(), name="worker-0")
+        force_stop = asyncio.Event()
+
+        failed = await asyncio.wait_for(
+            _drain([task], force_stop, grace_seconds=999, sleep=_never_sleep), timeout=5
+        )
+
+        assert failed is True
+        assert any("worker-0" in r.getMessage() for r in caplog.records)
+
+
+class TestForceShutdownOnDeath:
+    async def test_a_dying_task_sets_stop_claiming_and_records_why(self, caplog):
+        # The deadlock this exists to prevent: nothing else unblocks
+        # run()'s `await stop_claiming.wait()` if a task normally
+        # responsible for ending the crawl -- the supervisor, or now the
+        # drain watcher -- dies mid-crawl instead of just finishing.
+        caplog.set_level(logging.ERROR, logger="crawler.engine")
+        stop_claiming = asyncio.Event()
+        reasons: list[str] = []
+
+        async def boom() -> None:
+            raise RuntimeError("drain watcher broke")
+
+        task = asyncio.create_task(boom())
+        _force_shutdown_on_death(task, stop_claiming, reasons.append, "drain watcher")
+
+        with pytest.raises(RuntimeError):
+            await asyncio.wait_for(task, timeout=5)
+        await asyncio.sleep(0)  # let the done-callback run
+
+        assert stop_claiming.is_set()
+        assert reasons == ["drain watcher died"]
+        assert any("drain watcher" in r.getMessage() for r in caplog.records)
+
+    async def test_a_clean_completion_does_not_set_stop_claiming(self):
+        stop_claiming = asyncio.Event()
+        reasons: list[str] = []
+        task = asyncio.create_task(_instant_sleep(0))
+        _force_shutdown_on_death(task, stop_claiming, reasons.append, "supervisor")
+
+        await asyncio.wait_for(task, timeout=5)
+        await asyncio.sleep(0)
+
+        assert not stop_claiming.is_set()
+        assert reasons == []
+
 
 class TestRunEndToEnd:
     async def test_a_single_page_with_no_links_crawls_and_exits_cleanly(self, pool, tmp_path):
@@ -210,6 +332,28 @@ class TestRunEndToEnd:
         assert exit_code == 0
         row = await pool.fetchrow("SELECT status FROM urls WHERE normalized_url = $1", seed)
         assert row["status"] == "done"
+
+    async def test_logs_why_it_stopped_and_the_terminal_counts(self, pool, tmp_path, caplog):
+        caplog.set_level(logging.INFO, logger="crawler.engine")
+        seed = "http://fixture.local/"
+        routes = {
+            seed: [FakeResponse(200, {"Content-Type": "text/html"}, b"<html><body>no links</body></html>")]
+        }
+        async with _running(routes) as server:
+            config = Config(
+                seed_url=seed,
+                database_url=TEST_DATABASE_URL,
+                fetch_api_url=str(server.make_url("/fetch")),
+                output_dir=tmp_path,
+                max_concurrency=1,
+            )
+            await asyncio.wait_for(run(config, sleep=_instant_sleep), timeout=15)
+
+        lines = [r for r in caplog.records if r.getMessage() == "crawl stopped"]
+        assert len(lines) == 1
+        assert lines[0].context["reason"] == "drain"
+        assert lines[0].context["done"] == 1
+        assert lines[0].context["pending"] == 0
 
     async def test_a_missing_seed_url_is_rejected_before_touching_the_pool(self):
         config = Config(database_url=TEST_DATABASE_URL, fetch_api_url="http://unused/unused")

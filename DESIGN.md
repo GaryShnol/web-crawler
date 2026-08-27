@@ -166,3 +166,122 @@ around frontier writes would serialize every worker into single file,
 which is the concurrency the schema exists to provide. Would reconsider if
 a frontier operation ever needed to span more than one row atomically in a
 way row locks can't express.
+
+## Worker exceptions: contained per-url, watched per-process
+
+Chose one `except Exception` around all of `process_one`, recording the
+catch as its own `internal_error` `ErrorKind` and letting the worker keep
+claiming. Rejected letting a bug propagate out of `process_one` (the
+original behavior — an unhandled exception silently killed that worker
+task, with nothing logged and nothing recorded against the url) and
+rejected folding it into an existing `ErrorKind` (that would hide, in
+`crawler stats`, the difference between "the remote side is unreliable"
+and "this codebase has a bug").
+
+`internal_error` classifies `TEMPORARY_FAILURE`, not `PERMANENT_FAILURE`,
+on an asymmetry: a wasted retry costs at most `max_attempts - 1` fetches
+on a bounded frontier; a wrong `PERMANENT_FAILURE` buries a url forever on
+what might have been one pool blip, and nothing about resuming the crawl
+would ever reclaim it. It never reports to the rate limiter — no response
+came back, so there's no signal about the remote service to act on; only
+`429` and `Retry-After` move that.
+
+`CancelledError` is deliberately not caught — it's a `BaseException` in
+3.12, so `except Exception` already passes it through unchanged, same as
+shutdown always expected. A second failure while persisting the first
+(the fresh `pool.acquire()` for the `internal_error` write itself raising)
+also propagates: at that point the pool or the database is gone, there's
+nothing url-level left to do, and swallowing it would erase the only
+signal that the database is unreachable.
+
+That second case is why `engine.py` watches process health separately
+from crawl outcome. A worker task ending with a real exception (its
+containment failed, not one url) makes `run()` return `1` — `crawler
+stats`, not the exit code, is where a url that gave up after
+`max_attempts` shows up. The supervisor gets an `add_done_callback` on top
+of that same check: it sets `stop_claiming` (the event SIGTERM already
+uses) the moment it dies, because a dead supervisor stops lease recovery
+silently — without the callback, that only surfaces once the crawl stalls
+with everything leased and stuck, or hangs forever.
+
+## Drain detection: its own timer, and why the check needs no lock
+
+Chose a dedicated `_watch_drain` task polling `frontier.crawl_complete` on
+`drain_check_interval_seconds` (default 2s). Rejected doing this check
+inside `_supervise`, on `lease_recovery_interval_seconds` (`lease_seconds /
+2`, 60s by default) — the original shape. Those are two unrelated
+questions sharing one timer: how long a lease may go stale before it's
+worth reclaiming has nothing to do with how quickly an empty frontier
+should be noticed, and the second is a much cheaper, much more
+time-sensitive check — a `NOT EXISTS` over two partial indexes, not a
+sweep. Coupling them meant a fixture crawl that finished nine urls in two
+seconds could still take up to 60 more to exit, which reads as a hang to
+anyone running `docker compose up` and watching identical progress ticks
+scroll by. Would reconsider if `crawl_complete` ever stopped being a cheap
+existential check — a full table scan on that query would make polling it
+every 2s the wrong trade.
+
+Splitting the timer raised the question of whether the check itself needs
+new locking to stay correct at a faster cadence — it doesn't, and the
+reasoning is worth writing down since "how do you know the drain check is
+race-free" is the obvious follow-up question:
+
+`crawl_complete` reads `NOT EXISTS (SELECT 1 FROM urls WHERE status IN
+('pending', 'in_progress'))`. The race this has to survive: a worker
+finishes parsing a page, is about to enqueue the links it found, and the
+drain check runs in that exact window. If the check could see zero
+pending/in_progress rows *before* those links land, it would end the
+crawl with real work still about to be queued.
+
+It can't, because of where `enqueue_many` is called from. The only path
+that discovers new urls is `worker.py`'s `_persist_success`, and there,
+`enqueue_many` and `mark_done` run inside the same `conn.transaction()` as
+each other — the row's move out of `in_progress` and the insertion of
+whatever it linked to commit together or not at all. Under Postgres's
+default Read Committed isolation, a concurrent statement (the drain
+check's `SELECT`) either sees the pre-commit snapshot — the row is still
+`in_progress`, so `crawl_complete` is false regardless of the links not
+existing yet — or the post-commit one, where both the status flip and the
+new `pending` rows are visible together. There's no snapshot in between
+where the row reads terminal but the links it produced don't exist yet.
+The claim side has the same property for the opposite direction:
+`claim_batch`'s `pending → in_progress` transition is one `UPDATE …
+RETURNING` statement, so a row is never visible as neither.
+
+So the invariant is: **a `pending`/`in_progress` row can only ever spawn
+new `pending` rows as part of the same commit that ends its own
+`in_progress` status.** Given that, "no `pending`, no `in_progress`" is a
+true fixed point the instant any statement observes it — nothing left
+running could still add work without also still holding a row open that
+the check would have caught. This is a property of the *codebase*, not of
+`crawl_complete` or the schema — nothing in Postgres enforces it, and no
+lock makes it true. It holds only because every enqueue happens inside a
+persist transaction and nowhere else. Would reconsider — immediately, not
+eventually — if a handler or code path ever needs to enqueue outside that
+transaction (a fifth handler that discovers links asynchronously, say, or
+a retry path that re-queues something mid-flight); that would put a gap
+back in the exact place this argument depends on it not existing, and
+nothing currently guards against it. No test asserts "every `enqueue_many`
+call site runs inside the persist transaction that also ends the row's
+`in_progress` status" — the property that makes the drain check safe is
+presently upheld by convention, not by the type system or a test.
+
+## error_message: computed where the specifics live, not reconstructed downstream
+
+Chose an optional `detail` field on `Classification`, filled in only by the
+classifiers that hold real numbers or a caught exception: `classify`'s
+TRUNCATED_BODY branch (declared vs. actual bytes), `classify_oversized_body`
+(the cap and what was actually read), `classify_exception` (the exception's
+own class name — the only place connect-timeout and read-timeout still
+differ once both have collapsed to `ErrorKind.TIMEOUT`), and
+`classify_internal_error`/`classify_unparseable_content` (the caught
+exception's own `type(exc).__name__: exc` repr). Rejected building these
+strings in worker.py's `_persist_failure` by switching on `error_kind` —
+that's the persist layer re-deriving a fact the classifier already had for
+free, growing by one special case per `ErrorKind` that ever needs one.
+`FetchResult.error_detail` carries a fetch-level classifier's `detail`
+through the same way `error_kind` already does (see its own docstring): the
+one thing a caller recording a failure can't safely re-derive once the
+response is gone. The kinds with nothing to add (404, 429, 500, an
+unmatched status, an empty body) leave `detail` `None` rather than
+restating `error_kind` or a status code `fetch_attempts` already has.

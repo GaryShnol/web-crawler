@@ -84,53 +84,62 @@ A module gets created when it has work to do, not before.
 
 ## Where things stand
 
-Features 1–4 are merged into `main`. `feature/5-hardening` is committed but
+Features 1-4 are merged into `main`. `feature/5-hardening` is committed but
 not merged: change detection (5.2), observability (5.3), docker-compose and
 the Makefile (5.4). 5.1 — the SIGKILL resumability test — was never written.
+`feature/6-delivery` is the current branch: the adversarial review has run
+and its findings are being worked through.
 
 ### What is actually missing
 
-Feature 4 is finished as of this session: all four handlers exist and
-`handlers/html.py` extracts what CLAUDE.md's "What I'm building" promises. The
-two-run change-detection demo has been run once, manually, outside Docker
-(below) — it hasn't been run through `docker compose up` because that still
-hangs (next bullet), and it isn't wired into any test yet.
-
-- **`docker compose up` still cannot finish a crawl.** Untouched this
-  session — the demo below runs the crawler as a local `uv run` process
-  against the same test Postgres container (`crawler-test-pg`,
-  `localhost:55432`) and a locally-started `fake_api`, specifically to route
-  around this bug rather than depend on it being fixed. It hangs on the
-  first fetch, reproducibly, even at `MAX_CONCURRENCY=1`, and does not
-  reproduce outside Docker. Network from inside the stuck container is fine
-  and Postgres has nothing blocked, so the two live suspects are (a)
-  connection-pool exhaustion — 5.3 added `_progress` as a third
-  `pool.acquire()` consumer beside `_supervise` and every worker, so check
-  what `create_pool` derives `max_size` from — and (b) the rate limiter
-  starving, since `acquire()` runs before any network call and an ungranted
-  token is indistinguishable from a fetch that never returns.
-- **There is no `README.md`.** The two-run table below is meant to land in
-  it, not stand alone.
+- **`docker compose up` now finishes a crawl.** It failed for two unrelated
+  reasons, and both were found by running the delivery path itself rather
+  than the test suite, which stayed green throughout. First,
+  `docker-entrypoint.sh` was checked out with CRLF, so Linux looked for an
+  interpreter named `/bin/sh\r` and the container exited 255 before any
+  Python ran; `.gitattributes` pins `*.sh` to LF now. Second, drain
+  detection rode `lease_recovery_interval_seconds`, so a crawl that finished
+  nine urls in two seconds still took another sixty to exit — correct, but
+  indistinguishable from a hang to anyone watching it. Neither of the two
+  suspects previously recorded here, pool exhaustion and rate-limiter
+  starvation, was involved in either.
+- **Open review findings.** `contents.content_type` is `NOT NULL` while the
+  write path can hand it `None` for a response with no `Content-Type`
+  header. `Location` is captured onto `FetchResult.resolved_url` and never
+  read, so a redirect is classified as a transient failure and burns its
+  whole retry budget against the same 3xx. `encode_body`/`decode_body` are a
+  two-line wrapper with one production call site.
+- **`tests/fake_api/` only generates responses the code handles well.**
+  Nothing reachable from the seed page returns 404, 403, 429, 500, a missing
+  `Content-Type`, a redirect, or a malformed envelope, so no crawl has ever
+  traversed a failure end to end. Every missing fixture sits on the far side
+  of an `except` clause or a status branch nothing has driven.
+- **There is no `README.md`.** The two-run change-detection table below is
+  meant to land in it, not stand alone.
 - **`handlers/html.py` still doesn't honour `<base href>`.** Resolution
-  always uses the page's own url — unchanged from before this session, and
-  not part of what was asked for this step.
+  always uses the page's own url.
 - **`handlers/image.py` only registers PNG.** Sniffed by real PNG magic
-  bytes, not by asking Pillow to open anything — a second raster format
-  (JPEG, GIF, WebP) is one more `@register`'d file, same shape as this one,
-  whenever something actually needs it. The fixture site only ever serves
-  PNG.
+  bytes, not by asking Pillow to open anything — a second raster format is
+  one more `@register`'d file, same shape as this one, whenever something
+  actually needs it. The fixture site only ever serves PNG.
 
-Next, in order: the hang, then a `README.md` (the table below is the seed for
-its change-detection section), then review and delivery.
+Next, in order: the three open review findings, then the fake_api gaps
+above, then a `README.md`, then the worklog and delivery.
 
 ### Merged and working
 
 ```
 models.py    Outcome, FetchResponse(status_code, headers, body),
-             FetchResult(outcome, elapsed, resolved_url, response),
+             FetchResult(outcome, elapsed, resolved_url, response,
+                         error_kind=None, error_detail=None),
              find_header, parse_retry_after, encode_body/decode_body
-errors.py    ErrorKind, Classification, classify(response, prev_etag=None),
-             classify_oversized_body(), classify_exception(...)
+errors.py    ErrorKind (incl. internal_error), Classification(outcome,
+             error_kind, detail=None), classify(response, prev_etag=None),
+             classify_oversized_body(max_body_bytes, bytes_read),
+             classify_unparseable_content(exc), classify_internal_error(exc),
+             classify_exception(exc)
+             detail is set only where a classifier holds real numbers or a
+             caught exception; nothing downstream rebuilds it
 url_tools.py normalize(url, base=None), in_scope(url, seed_host, allow_subdomains)
 config.py    Config (pydantic-settings) — seed_url is optional; only
              engine.run() requires it, so `stats` needs no placeholder
@@ -215,9 +224,15 @@ handlers/video.py  VideoHandler "video/mp4" — kind "video", dir "videos", ext 
 
 worker.py    process_one(...) — one structured "url completed" log line per
              url, carrying outcome (done/skipped/unchanged/retrying/failed)
-             plus kind/links/hash_changed or error_kind
+             plus kind/links/hash_changed or error_kind. An uncaught bug is
+             contained here: logged, then written as a retryable
+             internal_error, rather than killing the worker silently
 engine.py    run(config, sleep=asyncio.sleep) -> int — bounded pool, lease
-             supervisor, progress task, graceful shutdown
+             supervisor, drain watcher, progress task, graceful shutdown.
+             Returns 1 if a worker or a support task died with a real
+             exception; a url that gave up after max_attempts does not
+             change it. Logs one "crawl stopped" line with the reason
+             (drain / signal / a dead support task) and terminal counts
 cli.py       `crawl <seed>` and `stats [--since <iso8601>]` (text report)
 tests/       fake_api/ test double + test_* for everything above
 ```
@@ -231,6 +246,7 @@ tests/       fake_api/ test double + test_* for everything above
 Config keys: `seed_url` (optional), `database_url`, `fetch_api_url`,
 `max_concurrency`, `max_depth`, `requests_per_second`, `max_attempts`,
 `lease_seconds`, `max_body_bytes`, `connect_timeout_seconds`,
+`drain_check_interval_seconds`,
 `read_timeout_seconds`, `allow_subdomains`, `lease_recovery_interval_seconds`,
 `poll_interval_seconds`, `shutdown_grace_seconds`, `progress_interval_seconds`,
 `rate_limit_min_rps`, `rate_limit_decrease_factor`,

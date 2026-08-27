@@ -12,6 +12,7 @@ from .models import FetchResponse, Outcome, find_header
 
 _PERMANENT_STATUSES = {404, 403}
 _TEMPORARY_STATUSES = {429, 500}
+_DETAIL_MAX = 500  # error_message is unbounded TEXT, but a stray huge repr shouldn't fill the row
 
 
 class ErrorKind(enum.Enum):
@@ -28,12 +29,20 @@ class ErrorKind(enum.Enum):
     TIMEOUT = "timeout"
     CONNECTION_ERROR = "connection_error"
     UNPARSEABLE_CONTENT = "unparseable_content"
+    INTERNAL_ERROR = "internal_error"
 
 
 @dataclass(frozen=True, slots=True)
 class Classification:
     outcome: Outcome
     error_kind: ErrorKind | None
+    detail: str | None = None
+
+
+def _describe(exc: BaseException) -> str:
+    """The one place an exception becomes an error_message (see DESIGN.md)."""
+    name, message = type(exc).__name__, str(exc)
+    return (f"{name}: {message}" if message else name)[:_DETAIL_MAX]
 
 
 def classify(response: FetchResponse, prev_etag: str | None = None) -> Classification:
@@ -69,22 +78,24 @@ def classify(response: FetchResponse, prev_etag: str | None = None) -> Classific
         except ValueError:
             mismatch = False
         if mismatch:
-            return Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.TRUNCATED_BODY)
+            detail = f"declared {declared} bytes, got {len(response.body)}"
+            return Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.TRUNCATED_BODY, detail)
 
     return Classification(Outcome.SUCCESS, None)
 
 
-def classify_oversized_body() -> Classification:
+def classify_oversized_body(max_body_bytes: int, bytes_read: int) -> Classification:
     """The one shape a body-too-large refusal can take. fetch/client.py stops
     reading once the response has run past `max_body_bytes` — before a
     status code or headers are even fully received, so there's nothing left
     to interpret the way classify() interprets a complete response. PERMANENT
     because a retry meets the same oversized body.
     """
-    return Classification(Outcome.PERMANENT_FAILURE, ErrorKind.BODY_TOO_LARGE)
+    detail = f"exceeded max_body_bytes={max_body_bytes} (read at least {bytes_read} bytes)"
+    return Classification(Outcome.PERMANENT_FAILURE, ErrorKind.BODY_TOO_LARGE, detail)
 
 
-def classify_unparseable_content() -> Classification:
+def classify_unparseable_content(exc: Exception) -> Classification:
     """A body that matched a handler's `sniff` but broke while being parsed —
     truncated, corrupt, or (for a PDF) encrypted. TEMPORARY, unlike
     classify_oversized_body()'s PERMANENT: the fetch API can return
@@ -93,7 +104,14 @@ def classify_unparseable_content() -> Classification:
     isn't guaranteed to meet the same broken body the way it's guaranteed
     to meet the same size.
     """
-    return Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.UNPARSEABLE_CONTENT)
+    return Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.UNPARSEABLE_CONTENT, _describe(exc))
+
+
+def classify_internal_error(exc: Exception) -> Classification:
+    """TEMPORARY on purpose, not PERMANENT (see DESIGN.md) -- a wasted
+    retry costs less than a url a pool blip buries forever.
+    """
+    return Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.INTERNAL_ERROR, _describe(exc))
 
 
 def classify_exception(
@@ -110,7 +128,7 @@ def classify_exception(
     are the transport failing, not a status the service returned.
     """
     if isinstance(exc, TimeoutError):
-        return Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.TIMEOUT)
+        return Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.TIMEOUT, _describe(exc))
     if isinstance(exc, (ClientConnectionError, ClientPayloadError)):
-        return Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.CONNECTION_ERROR)
+        return Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.CONNECTION_ERROR, _describe(exc))
     raise exc
