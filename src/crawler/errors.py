@@ -27,6 +27,7 @@ class ErrorKind(enum.Enum):
     UNEXPECTED_STATUS = "unexpected_status"
     TIMEOUT = "timeout"
     CONNECTION_ERROR = "connection_error"
+    UNPARSEABLE_CONTENT = "unparseable_content"
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +82,18 @@ def classify_oversized_body() -> Classification:
     because a retry meets the same oversized body.
     """
     return Classification(Outcome.PERMANENT_FAILURE, ErrorKind.BODY_TOO_LARGE)
+
+
+def classify_unparseable_content() -> Classification:
+    """A body that matched a handler's `sniff` but broke while being parsed —
+    truncated, corrupt, or (for a PDF) encrypted. TEMPORARY, unlike
+    classify_oversized_body()'s PERMANENT: the fetch API can return
+    different bytes for the same url on a later attempt (see CLAUDE.md's
+    "can return different things ... on different attempts"), so a retry
+    isn't guaranteed to meet the same broken body the way it's guaranteed
+    to meet the same size.
+    """
+    return Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.UNPARSEABLE_CONTENT)
 
 
 def classify_exception(

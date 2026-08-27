@@ -9,6 +9,7 @@ from crawler.errors import (
     classify,
     classify_exception,
     classify_oversized_body,
+    classify_unparseable_content,
 )
 from crawler.models import FetchResponse, Outcome
 
@@ -97,6 +98,14 @@ class TestBodyTooLarge:
     def test_oversized_body_is_permanent(self):
         result = classify_oversized_body()
         assert result == Classification(Outcome.PERMANENT_FAILURE, ErrorKind.BODY_TOO_LARGE)
+
+
+class TestUnparseableContent:
+    def test_unparseable_content_is_temporary(self):
+        # unlike an oversized body, a retry isn't guaranteed to see the same
+        # broken bytes — the fetch API can return something different next time.
+        result = classify_unparseable_content()
+        assert result == Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.UNPARSEABLE_CONTENT)
 
 
 class TestClassifyException:
