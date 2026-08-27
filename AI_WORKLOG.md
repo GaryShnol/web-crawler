@@ -126,6 +126,20 @@ recovery's 60s interval, so a crawl that finished in two seconds took
 sixty-nine to exit. The fix was a second interval, not the mechanism I said was
 missing.
 
+I read the fetch API's closed statusCode set (`200|404|429|403|500`, no 3xx) as
+proof a redirect could only ever surface as a `200` the API had already followed
+on my behalf — the same move `CLAUDE.md` already made for `ETag` against a
+status set with no `304` in it, so I extended it to `Location` too, and built
+`FetchResult.resolved_url` to catch the header off any response on that premise.
+Nothing ever demonstrated a real API 3xx to justify the jump. A later review
+challenged the reading using the same evidence the first pass had: the
+assignment's table was never a promise that 3xx can't arrive, only that it isn't
+documented, and an off-contract status still needs a real classification rather
+than being retried to exhaustion as `UNEXPECTED_STATUS`. That reading won —
+`resolved_url` came out (one write site, no reader, the same shape
+`encode_body`/`decode_body` turned out to be), and `errors.py` gained a
+dedicated `PERMANENT_FAILURE`/`REDIRECT` branch instead.
+
 ## Transcripts
 
 Every session is in `ai-transcripts/`, one file per step, unedited.
