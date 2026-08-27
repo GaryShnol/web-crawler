@@ -1,0 +1,2405 @@
+===== src\crawler\cli.py =====
+"""Entry point. `crawl <seed>` runs the crawler against that seed url;
+`stats` reports on whatever's already in the database. Every other
+setting comes from the environment (`.env`, docker-compose, etc.).
+"""
+
+import argparse
+import asyncio
+import sys
+from datetime import UTC, datetime
+
+from .config import Config
+from .engine import run
+from .logging import configure_logging
+from .store import db, stats
+
+
+def _format_stats(report: stats.Stats, since: datetime | None) -> str:
+    lines = ["status"]
+    for status, count in sorted(report.status_counts.items()):
+        lines.append(f"  {status:<12} {count}")
+
+    lines.append("")
+    lines.append("failure reasons (terminal only)")
+    if report.failure_reasons:
+        for kind, count in report.failure_reasons.items():
+            lines.append(f"  {kind:<16} {count}")
+    else:
+        lines.append("  none")
+
+    retried = report.attempts_total - report.urls_attempted
+    lines.append("")
+    lines.append(
+        f"attempts: {report.attempts_total} across {report.urls_attempted} urls attempted"
+        f" ({retried} retried)"
+    )
+
+    lines.append("")
+    lines.append("bytes by content type")
+    if report.bytes_by_type:
+        for content_type, total_bytes in report.bytes_by_type.items():
+            lines.append(f"  {content_type:<20} {total_bytes:,}")
+    else:
+        lines.append("  none")
+
+    lines.append("")
+    if report.dedup_total:
+        hit_rate = 1 - report.dedup_distinct / report.dedup_total
+        lines.append(
+            f"dedup: {report.dedup_distinct} distinct hashes across {report.dedup_total} stored"
+            f" urls ({hit_rate:.1%} hit rate)"
+        )
+    else:
+        lines.append("dedup: no urls stored yet")
+
+    lines.append("")
+    window = f"since {since.isoformat()}" if since is not None else "ever"
+    lines.append(f"content changed ({window}): {report.changed_count} urls")
+
+    return "\n".join(lines)
+
+
+async def _run_stats(config: Config, since: datetime | None) -> int:
+    pool = await db.create_pool(config)
+    try:
+        async with pool.acquire() as conn:
+            report = await stats.gather(conn, since)
+    finally:
+        await pool.close()
+    print(_format_stats(report, since))
+    return 0
+
+
+def _parse_since(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="crawler")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    crawl = subparsers.add_parser("crawl", help="crawl a seed url")
+    crawl.add_argument("seed", help="seed url to crawl")
+
+    stats_cmd = subparsers.add_parser("stats", help="report on the current crawl state")
+    stats_cmd.add_argument(
+        "--since",
+        type=_parse_since,
+        default=None,
+        help="only count content changes after this ISO-8601 timestamp",
+    )
+
+    args = parser.parse_args(argv)
+
+    if args.command == "crawl":
+        config = Config(seed_url=args.seed)
+        configure_logging(config.log_level)
+        return asyncio.run(run(config))
+
+    config = Config()  # stats never crawls; seed_url stays unset
+    return asyncio.run(_run_stats(config, args.since))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+===== src\crawler\config.py =====
+"""Runtime configuration, loaded from environment variables (and .env for local runs)."""
+
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Config(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+
+    # None only ever reaches run(), which requires it before crawling --
+    # `stats` never touches config.seed_url, so it has nothing to fake.
+    seed_url: str | None = None
+    database_url: str
+    fetch_api_url: str
+
+    max_concurrency: int = 8
+    max_depth: int | None = None
+    requests_per_second: float = 5.0
+    max_attempts: int = 5
+    lease_seconds: int = 120
+    max_body_bytes: int = 52_428_800
+    connect_timeout_seconds: float = 5.0
+    read_timeout_seconds: float = 30.0
+    allow_subdomains: bool = False
+
+    # None means "half of lease_seconds" — a fixed literal default would
+    # silently drift out of sync with a lease_seconds override.
+    lease_recovery_interval_seconds: float | None = None
+    poll_interval_seconds: float = 1.0
+    shutdown_grace_seconds: float = 30.0
+    progress_interval_seconds: float = 10.0
+
+    rate_limit_min_rps: float = 0.5
+    rate_limit_decrease_factor: float = 0.5
+    rate_limit_recovery_successes: int = 10
+    rate_limit_increase_rps: float = 0.5
+
+    retry_base_seconds: float = 1.0
+    retry_max_seconds: float = 60.0
+    output_dir: Path = Path("output")
+    log_level: str = "INFO"
+
+===== src\crawler\engine.py =====
+"""The bounded worker pool, the lease supervisor alongside it, and shutdown.
+`run(config)` seeds the frontier, starts `config.max_concurrency` workers and
+one supervisor, and returns once they've all stopped — either because the
+crawl finished on its own or because it was told to.
+
+Shutdown, either way, is: stop claiming, let whatever's in flight finish, and
+exit 0. A SIGINT or SIGTERM stops claiming; a second one skips the grace
+period and cancels immediately — worker.run()'s own CancelledError handler
+releases whatever lease that task was holding, which is what turns "still
+running when the grace expired" into a `pending` row again rather than a
+lease the next recovery sweep has to catch.
+"""
+
+import asyncio
+import contextlib
+import logging
+import signal
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from urllib.parse import urlsplit
+
+import asyncpg
+
+from . import worker
+from .config import Config
+from .fetch.client import FetchClient
+from .fetch.rate_limiter import RateLimiter
+from .store import db, frontier
+from .url_tools import normalize
+from .worker import _wait
+
+logger = logging.getLogger(__name__)
+
+MIGRATIONS_DIR = Path(__file__).resolve().parent.parent.parent / "migrations"
+
+
+async def _supervise(
+    pool: asyncpg.Pool,
+    stop_claiming: asyncio.Event,
+    interval: float,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    """Recovers expired leases and checks for a finished crawl on the same
+    tick, until `stop_claiming` is set — by a signal, or by this loop
+    itself the moment it finds the frontier empty. Stops immediately once
+    that happens: nothing is claiming once shutdown begins, so there's
+    nothing to recover, and a sweep mid-drain would push a row that's
+    actively being processed back to `pending`.
+    """
+    while not stop_claiming.is_set():
+        async with pool.acquire() as conn:
+            recovered = await frontier.recover_expired_leases(conn)
+            if recovered:
+                logger.info(f"recovered {recovered} expired lease(s)")
+            if await frontier.crawl_complete(conn):
+                stop_claiming.set()
+                return
+        await _wait(stop_claiming, interval, sleep)
+
+
+async def _progress(
+    pool: asyncpg.Pool,
+    rate_limiter: RateLimiter,
+    stop_claiming: asyncio.Event,
+    interval: float,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    """Logs the done/pending/in_progress/failed counts and the measured
+    rate against the permitted one every `interval` -- measured is done's
+    delta since the last tick, over `interval`; the frontier already
+    counts that, nothing new to track.
+    """
+    last_done = 0
+    while not stop_claiming.is_set():
+        async with pool.acquire() as conn:
+            counts = await frontier.status_counts(conn)
+        done = counts.get("done", 0)
+        measured, last_done = (done - last_done) / interval, done
+        rate = f"{measured:.1f}/s (limit {rate_limiter.current_rate:.1f}/s)"
+        stats = {s: counts.get(s, 0) for s in ("pending", "in_progress", "done", "failed")}
+        logger.info("progress", extra={"context": {**stats, "rate": rate}})
+        await _wait(stop_claiming, interval, sleep)
+
+
+async def _drain(
+    tasks: list[asyncio.Task],
+    force_stop: asyncio.Event,
+    grace_seconds: float,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    """Waits for every worker task to finish on its own — the normal case,
+    since `process_one` always runs to completion — up to `grace_seconds`
+    or a second signal (`force_stop`), whichever comes first; past that,
+    cancels whatever's still running and waits for the cancellation to land.
+    """
+    all_done = asyncio.gather(*tasks, return_exceptions=True)
+    timer = asyncio.ensure_future(sleep(grace_seconds))
+    forced = asyncio.ensure_future(force_stop.wait())
+    try:
+        await asyncio.wait({all_done, timer, forced}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for future in (timer, forced):
+            if not future.done():
+                future.cancel()
+
+    if not all_done.done():
+        for task in tasks:
+            task.cancel()
+        await all_done
+
+
+def _install_signal_handlers(stop_claiming: asyncio.Event, force_stop: asyncio.Event) -> None:
+    """First SIGINT/SIGTERM stops claiming; a second one of either forces an
+    immediate cancel instead of waiting out the grace period.
+    """
+    signalled = False
+
+    def handle() -> None:
+        nonlocal signalled
+        if signalled:
+            force_stop.set()
+        else:
+            signalled = True
+            stop_claiming.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, handle)
+        except NotImplementedError:
+            # Windows has no add_signal_handler; signal.signal's handler runs
+            # on the main thread same as everywhere else, so this is safe.
+            signal.signal(sig, lambda *_args: handle())
+
+
+async def run(config: Config, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep) -> int:
+    if config.seed_url is None:
+        raise ValueError("seed_url is required to crawl")
+
+    pool = await db.create_pool(config)
+    try:
+        await db.run_migrations(pool, MIGRATIONS_DIR)
+
+        seed_normalized = normalize(config.seed_url)
+        seed_host = urlsplit(seed_normalized).hostname
+        if seed_host is None:
+            raise ValueError(f"seed url has no host: {config.seed_url}")
+
+        async with pool.acquire() as conn:
+            await frontier.enqueue_many(
+                conn,
+                [
+                    frontier.DiscoveredLink(
+                        raw_url=config.seed_url, normalized_url=seed_normalized, anchor_text=None
+                    )
+                ],
+                depth=0,
+            )
+
+        stop_claiming = asyncio.Event()
+        force_stop = asyncio.Event()
+        _install_signal_handlers(stop_claiming, force_stop)
+
+        interval = config.lease_recovery_interval_seconds or config.lease_seconds / 2
+
+        async with FetchClient(config) as fetch_client:
+            rate_limiter = RateLimiter(config)
+            supervisor = asyncio.create_task(_supervise(pool, stop_claiming, interval, sleep))
+            progress = asyncio.create_task(
+                _progress(
+                    pool, rate_limiter, stop_claiming, config.progress_interval_seconds, sleep
+                )
+            )
+            workers = [
+                asyncio.create_task(
+                    worker.run(
+                        i, pool, fetch_client, rate_limiter, config, seed_host, stop_claiming, sleep
+                    )
+                )
+                for i in range(config.max_concurrency)
+            ]
+
+            await stop_claiming.wait()
+            await _drain(workers, force_stop, config.shutdown_grace_seconds, sleep)
+
+            for task in (supervisor, progress):
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+    finally:
+        await pool.close()
+
+    return 0
+
+===== src\crawler\errors.py =====
+"""Maps a fetch response onto the closed set of outcomes, once, so nothing
+else in src/ reads a status code. No retries, no backoff, no timing — those
+live in fetch/retry.py and fetch/client.py, driven by what classify() returns.
+"""
+
+import enum
+from dataclasses import dataclass
+
+from aiohttp import ClientConnectionError, ClientPayloadError
+
+from .models import FetchResponse, Outcome, find_header
+
+_PERMANENT_STATUSES = {404, 403}
+_TEMPORARY_STATUSES = {429, 500}
+
+
+class ErrorKind(enum.Enum):
+    """Why a failure happened. Unset on SUCCESS and NOT_MODIFIED."""
+
+    NOT_FOUND = "not_found"
+    FORBIDDEN = "forbidden"
+    RATE_LIMITED = "rate_limited"
+    SERVER_ERROR = "server_error"
+    EMPTY_BODY = "empty_body"
+    TRUNCATED_BODY = "truncated_body"
+    BODY_TOO_LARGE = "body_too_large"
+    UNEXPECTED_STATUS = "unexpected_status"
+    TIMEOUT = "timeout"
+    CONNECTION_ERROR = "connection_error"
+    UNPARSEABLE_CONTENT = "unparseable_content"
+
+
+@dataclass(frozen=True, slots=True)
+class Classification:
+    outcome: Outcome
+    error_kind: ErrorKind | None
+
+
+def classify(response: FetchResponse, prev_etag: str | None = None) -> Classification:
+    """The one place a status code gets read. Body and headers settle what a
+    status code alone can't: a truncated transfer, and a conditional hit,
+    which only exists as a 200 with an empty body and a matching ETag — an
+    empty body without that match is the service being flaky, not a real
+    "unchanged", so it's TEMPORARY_FAILURE and gets retried like any other.
+    """
+    status = response.status_code
+
+    if status in _PERMANENT_STATUSES:
+        kind = ErrorKind.NOT_FOUND if status == 404 else ErrorKind.FORBIDDEN
+        return Classification(Outcome.PERMANENT_FAILURE, kind)
+
+    if status in _TEMPORARY_STATUSES:
+        kind = ErrorKind.RATE_LIMITED if status == 429 else ErrorKind.SERVER_ERROR
+        return Classification(Outcome.TEMPORARY_FAILURE, kind)
+
+    if status != 200:
+        return Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.UNEXPECTED_STATUS)
+
+    if not response.body:
+        etag = find_header(response.headers, "ETag")
+        if etag is not None and etag == prev_etag:
+            return Classification(Outcome.NOT_MODIFIED, None)
+        return Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.EMPTY_BODY)
+
+    declared = find_header(response.headers, "Content-Length")
+    if declared is not None:
+        try:
+            mismatch = int(declared) != len(response.body)
+        except ValueError:
+            mismatch = False
+        if mismatch:
+            return Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.TRUNCATED_BODY)
+
+    return Classification(Outcome.SUCCESS, None)
+
+
+def classify_oversized_body() -> Classification:
+    """The one shape a body-too-large refusal can take. fetch/client.py stops
+    reading once the response has run past `max_body_bytes` — before a
+    status code or headers are even fully received, so there's nothing left
+    to interpret the way classify() interprets a complete response. PERMANENT
+    because a retry meets the same oversized body.
+    """
+    return Classification(Outcome.PERMANENT_FAILURE, ErrorKind.BODY_TOO_LARGE)
+
+
+def classify_unparseable_content() -> Classification:
+    """A body that matched a handler's `sniff` but broke while being parsed —
+    truncated, corrupt, or (for a PDF) encrypted. TEMPORARY, unlike
+    classify_oversized_body()'s PERMANENT: the fetch API can return
+    different bytes for the same url on a later attempt (see CLAUDE.md's
+    "can return different things ... on different attempts"), so a retry
+    isn't guaranteed to meet the same broken body the way it's guaranteed
+    to meet the same size.
+    """
+    return Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.UNPARSEABLE_CONTENT)
+
+
+def classify_exception(
+    exc: TimeoutError | ClientConnectionError | ClientPayloadError,
+) -> Classification:
+    """Same closed outcome set for a fetch that never produced a response.
+
+    Only the kinds fetch/client.py actually catches are named here. An
+    exception of any other type is a bug, not network flakiness, and gets
+    re-raised rather than folded into TEMPORARY_FAILURE — that would turn a
+    bug in this codebase into a retry loop that looks like a flaky network
+    and never surfaces as a failure to find. ClientPayloadError (the
+    connection dying mid-body) is grouped with ClientConnectionError: both
+    are the transport failing, not a status the service returned.
+    """
+    if isinstance(exc, TimeoutError):
+        return Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.TIMEOUT)
+    if isinstance(exc, (ClientConnectionError, ClientPayloadError)):
+        return Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.CONNECTION_ERROR)
+    raise exc
+
+===== src\crawler\logging.py =====
+"""JSON-lines logging to stdout, with contextvar-bound fields (url, worker_id, ...)."""
+
+import contextlib
+import contextvars
+import json
+import logging
+import sys
+from collections.abc import Iterator
+
+_context: contextvars.ContextVar[dict[str, object] | None] = contextvars.ContextVar(
+    "log_context", default=None
+)
+
+
+class _ContextFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Merge, not overwrite: a call site's own `extra={"context": {...}}`
+        # (record-specific detail) is set before this filter runs, and has
+        # to survive it — bound context (bind()'s bind, ambient for the
+        # whole span) goes in first, so a same-named call-site field wins.
+        record.context = {**(_context.get() or {}), **getattr(record, "context", {})}
+        return True
+
+
+class _JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            **getattr(record, "context", {}),
+        }
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=str)
+
+
+def configure_logging(level: str) -> None:
+    """Set up JSON-lines logging to stdout. Call once, at process start."""
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(_JsonFormatter())
+    handler.addFilter(_ContextFilter())
+
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(level)
+
+
+@contextlib.contextmanager
+def bind(**fields: object) -> Iterator[None]:
+    """Add fields to every log record emitted while the context manager is open.
+
+    A worker wraps its per-URL loop in this (e.g. `with bind(url=url, worker_id=n):`)
+    so every log line from that iteration carries the context, with no logger
+    threaded through the call stack to do it.
+    """
+    token = _context.set({**(_context.get() or {}), **fields})
+    try:
+        yield
+    finally:
+        _context.reset(token)
+
+===== src\crawler\models.py =====
+"""The fetch API's response shape, and what we track ourselves about a fetch attempt."""
+
+import base64
+import enum
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .errors import ErrorKind  # errors.py imports models.py; this side stays type-only
+
+
+class Outcome(enum.Enum):
+    """Closed set of fetch outcomes. errors.py maps status codes onto these; nothing else should."""
+
+    SUCCESS = "success"
+    NOT_MODIFIED = "not_modified"
+    PERMANENT_FAILURE = "permanent_failure"
+    TEMPORARY_FAILURE = "temporary_failure"
+
+
+def encode_body(body: bytes | None) -> str | None:
+    """How a `Buffer | null` body is assumed to cross the wire as JSON — the
+    real API's own encoding is unverifiable (see DESIGN.md), so this is a
+    guess: base64, or `null`. fetch/client.py and tests/fake_api both call
+    this pair instead of `base64.b64*` directly, so they can't quietly
+    diverge on the guess.
+    """
+    return base64.b64encode(body).decode() if body is not None else None
+
+
+def decode_body(encoded: str | None) -> bytes | None:
+    """The inverse of `encode_body` — see its docstring."""
+    return base64.b64decode(encoded) if encoded is not None else None
+
+
+def find_header(headers: dict[str, str], name: str) -> str | None:
+    """Case-insensitive header lookup — the API doesn't guarantee casing.
+    The one place this loop is written. Takes a plain dict rather than a
+    `FetchResponse`, because fetch/retry.py's `next_attempt` only ever has
+    the raw headers (see DESIGN.md), not a `FetchResponse` to call a method
+    on — `errors.py` and `fetch/client.py` call this the same way, on
+    `response.headers`, rather than a `FetchResponse.header()` wrapper that
+    would just be this loop reachable through a second name.
+    """
+    target = name.lower()
+    for key, value in headers.items():
+        if key.lower() == target:
+            return value
+    return None
+
+
+def parse_retry_after(headers: dict[str, str], now: datetime) -> float | None:
+    """Retry-After is delta-seconds ("120") or an HTTP-date ("Wed, 21 Oct
+    2015 07:28:00 GMT") per RFC 7231. Both fetch/retry.py (this URL's next
+    attempt) and whoever feeds fetch/rate_limiter.py (the shared pacing
+    hold) need this, so it's parsed once, here, next to the other header
+    reading this module already does — two parsers for one header is two
+    bugs.
+
+    `now` is a parameter, never read internally, so nothing that calls this
+    for a "pure" result (fetch/retry.py's next_attempt) is lying about it.
+    Returns seconds from `now`, never negative — an HTTP-date already in the
+    past means "retry immediately," not "retry before now."
+    """
+    value = find_header(headers, "Retry-After")
+    if value is None:
+        return None
+
+    try:
+        return max(float(value), 0.0)
+    except ValueError:
+        pass
+
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max((when - now).total_seconds(), 0.0)
+
+
+@dataclass(frozen=True, slots=True)
+class FetchResponse:
+    """Mirrors the fetch API's response body exactly: three fields, nothing else.
+
+    The API's own field is `statusCode`; the camelCase-to-snake_case translation
+    happens in fetch/client.py when this is built, not here.
+    """
+
+    status_code: int
+    headers: dict[str, str]
+    body: bytes | None
+
+
+@dataclass(frozen=True, slots=True)
+class FetchResult:
+    """What we measure ourselves about one fetch attempt, kept off FetchResponse.
+
+    No `attempt` here — the client doesn't know which attempt this is, the
+    worker does, off the row it claimed. A field only the caller can fill in
+    correctly doesn't belong on the callee's return type.
+
+    `error_kind` is `errors.classify*`'s own verdict, carried through rather
+    than dropped: fetch/client.py already computes it to decide `outcome`,
+    and it's the one thing a caller recording a failure (store/frontier.py's
+    mark_failed, which requires it) can't safely re-derive — a `response`-less
+    result (timeout, oversized body) has nothing left to reclassify from.
+    """
+
+    outcome: Outcome
+    elapsed: float
+    resolved_url: str | None
+    response: FetchResponse | None
+    error_kind: "ErrorKind | None" = None
+
+===== src\crawler\url_tools.py =====
+"""Pure URL normalization and scope checks. No I/O, no logging, nothing from config."""
+
+from urllib.parse import urljoin, urlsplit, urlunsplit
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+_UNRESERVED = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+
+
+def _normalize_pct(s: str) -> str:
+    """Uppercase every %XX escape's hex digits; decode it only if it's unreserved."""
+    out: list[str] = []
+    i = 0
+    while i < len(s):
+        if s[i] == "%" and i + 2 < len(s) and s[i + 1 : i + 3].isalnum():
+            hex_pair = s[i + 1 : i + 3]
+            try:
+                decoded = chr(int(hex_pair, 16))
+            except ValueError:
+                out.append(s[i])
+                i += 1
+                continue
+            out.append(decoded if decoded in _UNRESERVED else f"%{hex_pair.upper()}")
+            i += 3
+        else:
+            out.append(s[i])
+            i += 1
+    return "".join(out)
+
+
+def _remove_dot_segments(path: str) -> str:
+    """RFC 3986 5.2.4, minus the base case: only ever called on an absolute path."""
+    out: list[str] = []
+    for segment in path.split("/"):
+        if segment == "..":
+            if out and out[-1] != "":
+                out.pop()
+        elif segment != ".":
+            out.append(segment)
+    return "/".join(out)
+
+
+def normalize(url: str, base: str | None = None) -> str:
+    """Normalize scheme/host casing, default ports, ../, and percent-encoding.
+
+    Query parameter order is left as-is: reordering could merge two URLs that
+    serve different content, and that loss is silent and unrecoverable, while
+    leaving them apart costs at most one redundant fetch (see CLAUDE.md).
+    """
+    parsed = urlsplit(url)
+
+    if parsed.scheme and parsed.scheme not in ("http", "https"):
+        # mailto:, tel:, etc. have no authority or path to normalize — touch
+        # only the scheme and leave the rest exactly as given.
+        return f"{parsed.scheme.lower()}:{url[len(parsed.scheme) + 1:]}"
+
+    if not parsed.scheme and base is None:
+        # A relative or protocol-relative ref with nothing to resolve it
+        # against stays a relative ref — only fragment/percent-encoding apply.
+        return _normalize_pct(url.split("#", 1)[0])
+
+    resolved = urljoin(base, url) if base else url
+    parsed = urlsplit(resolved)
+
+    scheme = parsed.scheme.lower()
+    port = parsed.port
+    if port == _DEFAULT_PORTS.get(scheme):
+        port = None
+    netloc = parsed.hostname or ""
+    if parsed.username:
+        userinfo = parsed.username + (f":{parsed.password}" if parsed.password else "")
+        netloc = f"{userinfo}@{netloc}"
+    if port is not None:
+        netloc = f"{netloc}:{port}"
+
+    path = _normalize_pct(_remove_dot_segments(parsed.path))
+    query = _normalize_pct(parsed.query)
+
+    return urlunsplit((scheme, netloc, path, query, ""))
+
+
+def in_scope(url: str, seed_host: str, allow_subdomains: bool) -> bool:
+    """True if url's host is the seed host, or a subdomain of it when allowed."""
+    host = urlsplit(url).hostname
+    if not host:
+        return False
+    host = host.lower()
+    seed_host = seed_host.lower()
+    return host == seed_host or (allow_subdomains and host.endswith(f".{seed_host}"))
+
+===== src\crawler\worker.py =====
+"""One worker: claim a url, rate-limit, fetch it, route the response to a
+handler, persist what came back, enqueue whatever links it found, and land
+on a terminal status. Every database write for one url happens on one
+connection — the claim is its own short transaction that commits the
+instant it's taken (the lease has to be visible to every other worker and
+to the supervisor right away), and nothing about the fetch itself holds a
+transaction open. The write-up transaction opens only after the response
+is back, and covers content, metadata, links, and the terminal status as
+one commit or none of it.
+"""
+
+import asyncio
+import logging
+import random
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
+
+import asyncpg
+
+from .config import Config
+from .errors import ErrorKind, classify_unparseable_content
+from .fetch.client import FetchClient
+from .fetch.rate_limiter import RateLimiter
+from .fetch.retry import GiveUp, next_attempt
+from .handlers import base as handlers
+from .logging import bind
+from .models import FetchResult, Outcome, find_header, parse_retry_after
+from .store import blobs, frontier, metadata
+from .url_tools import in_scope
+
+logger = logging.getLogger(__name__)
+
+
+async def _fetch(
+    claimed: frontier.ClaimedUrl, fetch_client: FetchClient, rate_limiter: RateLimiter
+) -> FetchResult:
+    """Rate-limits, fetches, and feeds the outcome back to the shared
+    limiter — a 429 is the gateway pushing back, everything else advances
+    its recovery streak (see fetch/rate_limiter.py's report()).
+    """
+    await rate_limiter.acquire()
+    result = await fetch_client.fetch(claimed.url, prev_etag=claimed.etag)
+
+    throttled = result.error_kind is ErrorKind.RATE_LIMITED
+    retry_after = None
+    if throttled and result.response is not None:
+        retry_after = parse_retry_after(result.response.headers, datetime.now(UTC))
+    rate_limiter.report(throttled=throttled, retry_after=retry_after)
+
+    return result
+
+
+async def _persist_success(
+    pool: asyncpg.Pool,
+    claimed: frontier.ClaimedUrl,
+    result: FetchResult,
+    config: Config,
+    seed_host: str,
+) -> dict[str, object]:
+    """Writes what landed and returns the fields the one completion line
+    logs for it — never logs itself, so success, failure and NOT_MODIFIED
+    all resolve to exactly one log call, in process_one.
+    """
+    response = result.response
+    assert response is not None and response.body
+    content_type = find_header(response.headers, "Content-Type")
+    handler = handlers.resolve(content_type, response.body)
+
+    if handler is None:
+        async with pool.acquire() as conn, conn.transaction():
+            await frontier.mark_skipped(
+                conn,
+                claimed.id,
+                claimed.lease_token,
+                content_type=content_type,
+                content_length=len(response.body),
+            )
+        return {"outcome": "skipped"}
+
+    try:
+        handled = handler.handle(response.body, claimed.url)
+    except Exception:
+        # A body that passed handler.sniff() can still be truncated,
+        # corrupt, or (a PDF) encrypted -- real conditions this crawler is
+        # meant to survive, not a bug in this codebase. Nothing's been
+        # written yet (blobs.write hasn't run), so this leaves no orphaned
+        # blob or contents row -- just a failure/retry outcome, same shape
+        # as a fetch-level one.
+        logger.exception("handler failed to parse a sniff-matched body", extra={"context": {"kind": handler.kind}})
+        classification = classify_unparseable_content()
+        decision = next_attempt(
+            classification.outcome,
+            claimed.attempt_no,
+            response.headers,
+            datetime.now(UTC),
+            config,
+            jitter=random.random(),
+        )
+        async with pool.acquire() as conn, conn.transaction():
+            await frontier.mark_failed(conn, claimed.id, claimed.lease_token, decision, classification.error_kind)
+        outcome = "failed" if isinstance(decision, GiveUp) else "retrying"
+        return {"outcome": outcome, "error_kind": classification.error_kind.value}
+
+    content_hash, storage_path = blobs.write(
+        config.output_dir, handler.directory, handler.extension, claimed.url, response.body
+    )
+    enqueueable_links = [
+        link
+        for link in handled.links
+        if link.is_asset or in_scope(link.normalized_url, seed_host, config.allow_subdomains)
+    ]
+    next_depth = claimed.depth + 1
+    within_depth = config.max_depth is None or next_depth <= config.max_depth
+
+    async with pool.acquire() as conn, conn.transaction():
+        await metadata.insert_content(
+            conn, content_hash, content_type, len(response.body), storage_path
+        )
+        if handled.metadata is not None:
+            await metadata.insert_metadata(conn, content_hash, handler.kind, handled.metadata)
+        if enqueueable_links and within_depth:
+            await frontier.enqueue_many(conn, enqueueable_links, depth=next_depth, src_id=claimed.id)
+        previous_hash = await frontier.mark_done(
+            conn,
+            claimed.id,
+            claimed.lease_token,
+            content_type=content_type,
+            content_length=len(response.body),
+            content_hash=content_hash,
+            etag=find_header(response.headers, "ETag"),
+        )
+
+    context: dict[str, object] = {
+        "outcome": "done",
+        "kind": handler.kind,
+        "links": len(enqueueable_links),
+    }
+    if previous_hash is not None:  # only a revisit has a hash to compare against
+        context["hash_changed"] = previous_hash != content_hash
+    return context
+
+
+async def _persist_failure(
+    pool: asyncpg.Pool, claimed: frontier.ClaimedUrl, result: FetchResult, config: Config
+) -> dict[str, object]:
+    assert result.error_kind is not None
+    headers = result.response.headers if result.response is not None else {}
+    decision = next_attempt(
+        result.outcome, claimed.attempt_no, headers, datetime.now(UTC), config, jitter=random.random()
+    )
+    async with pool.acquire() as conn, conn.transaction():
+        await frontier.mark_failed(conn, claimed.id, claimed.lease_token, decision, result.error_kind)
+    outcome = "failed" if isinstance(decision, GiveUp) else "retrying"
+    return {"outcome": outcome, "error_kind": result.error_kind.value}
+
+
+async def process_one(
+    pool: asyncpg.Pool,
+    claimed: frontier.ClaimedUrl,
+    *,
+    fetch_client: FetchClient,
+    rate_limiter: RateLimiter,
+    config: Config,
+    seed_host: str,
+) -> None:
+    """Runs one claimed url end to end and logs exactly one structured
+    completion line for it, carrying `outcome` alongside the url/attempt
+    bound below and the worker_id bound by run() — never one line per
+    step. Never raises for a fetch or classification outcome — those all
+    land as a terminal write and that one line; only a real bug (a
+    database error, cancellation) propagates.
+    """
+    with bind(url=claimed.url, attempt=claimed.attempt_no):
+        result = await _fetch(claimed, fetch_client, rate_limiter)
+
+        async with pool.acquire() as conn:
+            await frontier.record_attempt(
+                conn,
+                claimed.id,
+                claimed.attempt_no,
+                status_code=result.response.status_code if result.response else None,
+                elapsed=result.elapsed,
+                error_kind=result.error_kind,
+            )
+
+        if result.outcome is Outcome.SUCCESS:
+            context = await _persist_success(pool, claimed, result, config, seed_host)
+        elif result.outcome is Outcome.NOT_MODIFIED:
+            async with pool.acquire() as conn, conn.transaction():
+                await frontier.mark_unchanged(conn, claimed.id, claimed.lease_token)
+            context = {"outcome": "unchanged"}
+        else:
+            context = await _persist_failure(pool, claimed, result, config)
+
+        logger.info("url completed", extra={"context": context})
+
+
+async def _wait(event: asyncio.Event, timeout: float, sleep: Callable[[float], Awaitable[None]]) -> None:
+    """Waits for `event`, or `timeout` seconds via `sleep`, whichever comes
+    first. A cancellable, clock-injectable stand-in for
+    `asyncio.wait_for(event.wait(), timeout)`, which is bound to the real
+    event loop clock and so can't be sped up in a test — see
+    fetch/rate_limiter.py's `now`/`sleep` for the same reasoning.
+    """
+    event_wait = asyncio.ensure_future(event.wait())
+    timer = asyncio.ensure_future(sleep(timeout))
+    try:
+        await asyncio.wait({event_wait, timer}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for future in (event_wait, timer):
+            if not future.done():
+                future.cancel()
+
+
+async def run(
+    worker_id: int,
+    pool: asyncpg.Pool,
+    fetch_client: FetchClient,
+    rate_limiter: RateLimiter,
+    config: Config,
+    seed_host: str,
+    stop_claiming: asyncio.Event,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    """One worker task's whole life: claim one url at a time and process it
+    until told to stop claiming. `limit=1` on every claim, on purpose — a
+    bigger batch starts its lease clock on urls sitting in a queue for
+    nothing, burning lease_seconds before a worker even looks at them.
+
+    Cancellation (the engine's shutdown grace expiring) is only ever
+    delivered while `process_one` is awaited below — a claimed row still
+    `in_progress` with no terminal write ever made for it, so it's released
+    back to `pending` here rather than left to lease expiry, which is
+    exactly why release() exists.
+    """
+    with bind(worker_id=worker_id):
+        while not stop_claiming.is_set():
+            async with pool.acquire() as conn:
+                claimed = await frontier.claim_batch(conn, 1, config)
+
+            if not claimed:
+                await _wait(stop_claiming, config.poll_interval_seconds, sleep)
+                continue
+
+            [claimed_url] = claimed
+            try:
+                await process_one(
+                    pool,
+                    claimed_url,
+                    fetch_client=fetch_client,
+                    rate_limiter=rate_limiter,
+                    config=config,
+                    seed_host=seed_host,
+                )
+            except asyncio.CancelledError:
+                async with pool.acquire() as conn:
+                    await frontier.release(conn, claimed_url.id, claimed_url.lease_token)
+                raise
+
+===== src\crawler\__init__.py =====
+
+===== src\crawler\fetch\client.py =====
+"""Talks to the fetch API — never the target URL directly. See CLAUDE.md:
+the API is a black box behind `GET /fetch?url=<encoded>`, unreliable and
+rate-limited, returning `{statusCode, headers, body}` for whatever URL we
+ask about. Retries, rate limiting, and the frontier are someone else's job;
+this is url in, `FetchResult` out.
+"""
+
+import json
+import math
+import time
+from typing import Self
+
+import aiohttp
+
+from ..config import Config
+from ..errors import classify, classify_exception, classify_oversized_body
+from ..models import FetchResponse, FetchResult, decode_body, find_header
+
+_BASE64_GROUP = 4  # base64 emits 4 output bytes per 3 input bytes
+_ENVELOPE_OVERHEAD_BYTES = 8192  # room for statusCode, headers, and JSON punctuation
+
+
+async def _read_capped(http_response: aiohttp.ClientResponse, max_body_bytes: int) -> bytes | None:
+    """Stream the raw response instead of buffering it whole — the point of
+    the cap is to never hold more than roughly `max_body_bytes` in memory,
+    and `await http_response.json()` reads the entire body first regardless
+    of what a (possibly lying) Content-Length claims. Returns None, with the
+    connection already closed, once the cap is exceeded.
+
+    The body arrives base64-encoded inside a JSON envelope, so the raw bytes
+    run ~4/3 larger than the asset they encode; `_ENVELOPE_OVERHEAD_BYTES`
+    covers everything else in the envelope. The cap is therefore coarse, not
+    byte-exact against the decoded body — the goal is bounding memory, not
+    enforcing the limit to the byte.
+    """
+    cap = _ENVELOPE_OVERHEAD_BYTES + _BASE64_GROUP * math.ceil((max_body_bytes + 1) / 3)
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in http_response.content.iter_chunked(65536):
+        total += len(chunk)
+        if total > cap:
+            http_response.close()
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+class FetchClient:
+    """Owns one `aiohttp.ClientSession` for its lifetime. The engine opens
+    one of these and hands it to workers — not a module-level session, which
+    a test can't close and a process can't have two of.
+    """
+
+    def __init__(self, config: Config) -> None:
+        self._config = config
+        self._session: aiohttp.ClientSession | None = None
+
+    async def __aenter__(self) -> Self:
+        timeout = aiohttp.ClientTimeout(
+            connect=self._config.connect_timeout_seconds,
+            sock_read=self._config.read_timeout_seconds,
+        )
+        self._session = aiohttp.ClientSession(timeout=timeout)
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        assert self._session is not None
+        await self._session.close()
+        self._session = None
+
+    async def fetch(self, url: str, prev_etag: str | None = None) -> FetchResult:
+        """One call to the fetch API for `url`. No retries: a failure comes
+        back classified, once, for the caller to act on.
+        """
+        assert self._session is not None, "FetchClient must be used as `async with FetchClient(...)`"
+
+        headers = {"If-None-Match": prev_etag} if prev_etag is not None else {}
+        started = time.monotonic()
+
+        try:
+            async with self._session.get(
+                self._config.fetch_api_url, params={"url": url}, headers=headers
+            ) as http_response:
+                raw = await _read_capped(http_response, self._config.max_body_bytes)
+        except (TimeoutError, aiohttp.ClientConnectionError, aiohttp.ClientPayloadError) as exc:
+            classification = classify_exception(exc)
+            return FetchResult(
+                outcome=classification.outcome,
+                elapsed=time.monotonic() - started,
+                resolved_url=None,
+                response=None,
+                error_kind=classification.error_kind,
+            )
+
+        elapsed = time.monotonic() - started
+
+        if raw is None:
+            classification = classify_oversized_body()
+            return FetchResult(
+                outcome=classification.outcome,
+                elapsed=elapsed,
+                resolved_url=None,
+                response=None,
+                error_kind=classification.error_kind,
+            )
+
+        envelope = json.loads(raw)
+        body = decode_body(envelope.get("body"))
+
+        response = FetchResponse(
+            status_code=envelope["statusCode"], headers=envelope.get("headers") or {}, body=body
+        )
+        classification = classify(response, prev_etag)
+
+        return FetchResult(
+            outcome=classification.outcome,
+            elapsed=elapsed,
+            resolved_url=find_header(response.headers, "Location"),
+            response=response,
+            error_kind=classification.error_kind,
+        )
+
+===== src\crawler\fetch\rate_limiter.py =====
+"""One shared token bucket, AIMD-paced. There's one fetch gateway behind
+every worker, so there's one bucket: a per-worker hold would just let the
+other workers keep hitting a gateway that's already complaining.
+"""
+
+import asyncio
+from collections.abc import Awaitable, Callable
+from time import monotonic
+
+from ..config import Config
+
+
+class RateLimiter:
+    """Async-safe. `acquire()` blocks until pacing allows one fetch;
+    `report()` feeds back what happened after it — never the reverse, since
+    a caller asking permission hasn't fetched yet and has no outcome to
+    report. One instance, shared by every worker.
+
+    `now`/`sleep` default to the real clock; a caller supplies its own to
+    control time deterministically — a production engine never needs to.
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        now: Callable[[], float] = monotonic,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        self._config = config
+        self._now = now
+        self._sleep = sleep
+        self._rate = config.requests_per_second
+        self._tokens = self._capacity()
+        self._last_refill = self._now()
+        self._blocked_until = 0.0
+        self._success_streak = 0
+        self._lock = asyncio.Lock()
+
+    @property
+    def current_rate(self) -> float:
+        """The AIMD ceiling in effect right now — what `acquire()` is
+        currently pacing to, not necessarily what's actually happening if
+        there's little work queued.
+        """
+        return self._rate
+
+    def _capacity(self) -> float:
+        """Burst allowance: one second of the *current* rate, floor 1. If
+        this didn't shrink with the rate, a multiplicative cut wouldn't bite
+        until the leftover burst from before the 429 was spent — exactly the
+        second that matters.
+        """
+        return max(self._rate, 1.0)
+
+    def _refill(self, now: float) -> None:
+        self._tokens = min(self._capacity(), self._tokens + (now - self._last_refill) * self._rate)
+        self._last_refill = now
+
+    async def acquire(self) -> None:
+        while True:
+            async with self._lock:
+                now = self._now()
+                self._refill(now)
+                wait = max(self._blocked_until - now, 0.0)
+                if wait == 0.0 and self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                if wait == 0.0:
+                    wait = (1.0 - self._tokens) / self._rate
+            await self._sleep(wait)
+
+    def report(self, throttled: bool, retry_after: float | None = None) -> None:
+        """No `await` in this function, on purpose: asyncio never preempts a
+        sync function mid-body, so it can mutate the shared state safely
+        without the lock `acquire()` needs around its own suspend points.
+
+        `throttled` means a 429 — the gateway pushing back, not a target
+        page 404ing or 500ing, which is a different kind of trouble that
+        fetch/retry.py already slows down on its own. Only a 429 cuts the
+        rate or breaks the recovery streak; everything else advances it, so
+        one dead page can't hold the whole crawl at the floor.
+        """
+        if throttled:
+            self._success_streak = 0
+            if retry_after is not None:
+                self._blocked_until = max(self._blocked_until, self._now() + retry_after)
+            else:
+                self._rate = max(
+                    self._config.rate_limit_min_rps,
+                    self._rate * self._config.rate_limit_decrease_factor,
+                )
+            return
+
+        self._success_streak += 1
+        if self._success_streak >= self._config.rate_limit_recovery_successes:
+            self._rate = min(
+                self._config.requests_per_second, self._rate + self._config.rate_limit_increase_rps
+            )
+            self._success_streak = 0
+
+===== src\crawler\fetch\retry.py =====
+"""Given what happened to one attempt, decides when — or whether — a URL
+gets tried again. Pure: `now` and `jitter` are parameters, never read or
+drawn internally, so a caller gets exact, reproducible bounds without
+seeding a global RNG or waiting on a clock.
+"""
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+
+from ..config import Config
+from ..models import Outcome, parse_retry_after
+
+
+@dataclass(frozen=True, slots=True)
+class RetryAt:
+    at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class GiveUp:
+    """Either the outcome was PERMANENT_FAILURE, or `attempt_no` had already
+    reached `config.max_attempts` — the caller already has both facts if it
+    wants to say which.
+    """
+
+
+def next_attempt(
+    outcome: Outcome,
+    attempt_no: int,
+    headers: dict[str, str],
+    now: datetime,
+    config: Config,
+    jitter: float | None = None,
+) -> GiveUp | RetryAt:
+    """`outcome` must be PERMANENT_FAILURE or TEMPORARY_FAILURE — SUCCESS and
+    NOT_MODIFIED never need a next attempt, so asking for one here is a
+    caller bug, not a case this handles quietly.
+
+    `attempt_no` counts attempts already made: the first failure calls this
+    with `attempt_no=1`.
+
+    A `Retry-After` on the response overrides the backoff formula entirely —
+    the service naming the exact time beats a guess, and every worker is
+    already held on that same header via the shared rate limiter, so
+    honouring it here doesn't concentrate load anywhere.
+
+    Without one, the delay is full jitter over
+    `min(config.retry_max_seconds, config.retry_base_seconds * 2 ** (attempt_no - 1))`.
+    `jitter` is the pre-drawn fraction in [0, 1] to scale that by — pass 0 or
+    1 in a test for the exact bounds. Leaving it `None` applies no
+    reduction (the full capped delay), since this function never draws its
+    own randomness.
+    """
+    assert outcome in (Outcome.PERMANENT_FAILURE, Outcome.TEMPORARY_FAILURE)
+
+    if outcome is Outcome.PERMANENT_FAILURE:
+        return GiveUp()
+
+    if attempt_no >= config.max_attempts:
+        return GiveUp()
+
+    retry_after = parse_retry_after(headers, now)
+    if retry_after is not None:
+        return RetryAt(now + timedelta(seconds=retry_after))
+
+    max_delay = min(config.retry_max_seconds, config.retry_base_seconds * 2 ** (attempt_no - 1))
+    fraction = 1.0 if jitter is None else jitter
+    return RetryAt(now + timedelta(seconds=fraction * max_delay))
+
+===== src\crawler\fetch\__init__.py =====
+
+===== src\crawler\handlers\base.py =====
+"""What a handler is: the registry, the shape every handler implements, and
+the boundary between routed content and what a handler extracts from it.
+worker.py depends on this module, not on any concrete handler — routing is
+this registry's decision, not worker.py's, so a fifth type is one new file
+and one `@register` decorator here, with no edit to worker.py or to any
+other handler.
+"""
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Protocol
+
+from ..store.frontier import DiscoveredLink
+
+
+@dataclass(frozen=True, slots=True)
+class HandlerResult:
+    """What handling one body produced. `metadata` is `None` when a handler
+    has nothing yet worth a `content_metadata` row for — not every field a
+    handler could someday extract, just what it actually extracts today;
+    `None` here means "not yet implemented", not "legitimately absent"
+    (that case is a real payload with a null field and a reason — see
+    CLAUDE.md's unknowable-field decision, which doesn't apply until a
+    handler has fields to be missing from).
+    """
+
+    metadata: dict[str, object] | None
+    links: list[DiscoveredLink]
+
+
+class Handler(Protocol):
+    """One instance per content family, held in the registry below.
+
+    `kind` names the family for `content_metadata.kind` (e.g. "page").
+    `directory`/`extension` name where a matched body's blob lands under
+    `output_dir` — see CLAUDE.md's blob-naming decision. Both come from the
+    handler that matched, never from the URL, because the handler is what
+    verified the content actually is what it claims to be.
+    """
+
+    kind: str
+    directory: str
+    extension: str
+
+    def sniff(self, body: bytes) -> bool:
+        """True if `body`'s own bytes are this handler's type — magic bytes,
+        never the declared Content-Type and never the URL. The one check
+        that can't be spoofed by a wrong header (CLAUDE.md: "headers that
+        lie").
+        """
+        ...
+
+    def handle(self, body: bytes, url: str) -> HandlerResult: ...
+
+
+_REGISTRY: dict[str, Handler] = {}
+
+
+def register(content_type: str) -> Callable[[type[Handler]], type[Handler]]:
+    """Decorator: `@register("text/html")` on a handler class registers one
+    instance of it, filed under the Content-Type it's normally declared
+    with. That filing is only a hint for `resolve` below to try first —
+    the real routing decision is always `sniff`, since a declared
+    Content-Type is exactly the thing that can lie.
+    """
+
+    def decorator(cls: type[Handler]) -> type[Handler]:
+        _REGISTRY[content_type] = cls()
+        return cls
+
+    return decorator
+
+
+def resolve(content_type: str | None, body: bytes) -> Handler | None:
+    """The routed handler for `body`, or `None` if nothing registered
+    matches — the "skipped" case (DESIGN.md). Trusts `content_type` only as
+    a hint about which handler to try first; every registered handler's
+    `sniff` gets a chance regardless, so a mislabeled body still lands on
+    the handler its bytes actually match.
+    """
+    hint = _REGISTRY.get(content_type.split(";", 1)[0].strip().lower()) if content_type else None
+    if hint is not None and hint.sniff(body):
+        return hint
+    for handler in _REGISTRY.values():
+        if handler is not hint and handler.sniff(body):
+            return handler
+    return None
+
+===== src\crawler\handlers\html.py =====
+"""HTML: title, outbound links, and asset urls, resolved against the page's
+own url. `a[href]` links to the next page, in- or out-of-scope alike --
+worker.py decides which get enqueued. `img[src]`, `video[src]`, `source[src]`
+and `embed[src]` are leaves -- a direct download regardless of host
+(CLAUDE.md's off-host-assets decision) -- so they carry `is_asset=True` for
+worker.py to bypass the scope check on. `<base href>` still isn't honoured;
+resolution always uses the page's own url.
+"""
+
+from selectolax.parser import HTMLParser
+
+from ..store.frontier import DiscoveredLink
+from ..url_tools import normalize
+from .base import Handler, HandlerResult, register
+
+# HTML has no fixed magic number the way a PNG or a PDF does, so this is a
+# WHATWG-mimesniff-lite check: after a BOM and leading ASCII whitespace,
+# does a recognizable tag open near the start? Good enough to catch both a
+# genuine page and a body mislabeled as something else (site.py's
+# LYING_CONTENT_TYPE fixture is exactly this), without scanning the whole
+# body for a coincidental "<html" anywhere in it.
+_SNIFF_MARKERS = (b"<!doctype html", b"<html", b"<head", b"<body")
+_SNIFF_WINDOW = 512
+_ASSET_SELECTOR = "img[src], video[src], source[src], embed[src]"
+
+
+def _looks_like_html(body: bytes) -> bool:
+    stripped = body.lstrip(b"\xef\xbb\xbf").lstrip(b" \t\n\r\x0c")
+    head = stripped[:_SNIFF_WINDOW].lower()
+    return any(marker in head for marker in _SNIFF_MARKERS)
+
+
+@register("text/html")
+class HtmlHandler(Handler):
+    kind = "page"
+    directory = "pages"
+    extension = "html"
+
+    def sniff(self, body: bytes) -> bool:
+        return _looks_like_html(body)
+
+    def handle(self, body: bytes, url: str) -> HandlerResult:
+        tree = HTMLParser(body)
+
+        links: list[DiscoveredLink] = []
+        for node in tree.css("a[href]"):
+            href = (node.attributes.get("href") or "").strip()
+            if not href:
+                continue
+            anchor_text = node.text(deep=True).strip() or None
+            links.append(
+                DiscoveredLink(
+                    raw_url=href, normalized_url=normalize(href, base=url), anchor_text=anchor_text
+                )
+            )
+        for node in tree.css(_ASSET_SELECTOR):
+            src = (node.attributes.get("src") or "").strip()
+            if not src:
+                continue
+            links.append(
+                DiscoveredLink(
+                    raw_url=src,
+                    normalized_url=normalize(src, base=url),
+                    anchor_text=None,
+                    is_asset=True,
+                )
+            )
+
+        title_node = tree.css_first("title")
+        title = title_node.text(deep=True).strip() if title_node is not None else None
+        metadata = {"title": title or None, "link_count": len(links)}
+        return HandlerResult(metadata=metadata, links=links)
+
+===== src\crawler\handlers\image.py =====
+"""Image: PNG bodies, sniffed by the format's own magic bytes -- never the
+declared Content-Type or the url. Dimensions come from Pillow. Only PNG is
+registered here; another raster format is a natural follow-up, its own
+@register'd file, the same shape as this one -- this covers what the fixture
+site actually serves.
+"""
+
+import io
+
+from PIL import Image
+
+from .base import Handler, HandlerResult, register
+
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+@register("image/png")
+class ImageHandler(Handler):
+    kind = "image"
+    directory = "images"
+    extension = "png"
+
+    def sniff(self, body: bytes) -> bool:
+        return body.startswith(_PNG_MAGIC)
+
+    def handle(self, body: bytes, url: str) -> HandlerResult:
+        with Image.open(io.BytesIO(body)) as image:
+            width, height = image.size
+        metadata = {"width": width, "height": height, "file_size": len(body)}
+        return HandlerResult(metadata=metadata, links=[])
+
+===== src\crawler\handlers\pdf.py =====
+"""PDF: sniffed by the `%PDF-` header every PDF starts with, page count and
+title read with pypdf.
+"""
+
+import io
+
+from pypdf import PdfReader
+
+from .base import Handler, HandlerResult, register
+
+_PDF_MAGIC = b"%PDF-"
+
+
+@register("application/pdf")
+class PdfHandler(Handler):
+    kind = "pdf"
+    directory = "pdfs"
+    extension = "pdf"
+
+    def sniff(self, body: bytes) -> bool:
+        return body.startswith(_PDF_MAGIC)
+
+    def handle(self, body: bytes, url: str) -> HandlerResult:
+        reader = PdfReader(io.BytesIO(body))
+        title = reader.metadata.title if reader.metadata else None
+        metadata = {"page_count": len(reader.pages), "title": title}
+        return HandlerResult(metadata=metadata, links=[])
+
+===== src\crawler\handlers\video.py =====
+"""Video: MP4 bodies, sniffed by the `ftyp` box's own major brand. `ftyp` at
+offset 4 is shared by the whole ISO-BMFF family -- HEIC, M4A, MOV, 3GP and
+more all start with it too -- so the brand at offset 8 is checked against a
+known-MP4 set rather than accepting every `ftyp`-prefixed body; otherwise a
+HEIC photo or an M4A track could fall through base.py's every-handler-sniff
+fallback and land here mislabeled as video. Duration comes from shelling out
+to ffprobe against a throwaway temp file -- `handle` only ever gets bytes,
+not a path. ffprobe is opportunistic (CLAUDE.md): missing from PATH, or
+present but with nothing in the container for it to read
+(tests/fake_api/payloads.py's tiny_video_no_duration is exactly that second
+case), both land as a null duration with a reason -- not a retryable failure
+either way.
+"""
+
+import os
+import shutil
+import subprocess
+import tempfile
+
+from .base import Handler, HandlerResult, register
+
+_FTYP_MAGIC = b"ftyp"
+_MP4_BRANDS = {b"isom", b"iso2", b"mp41", b"mp42", b"avc1", b"M4V ", b"dash", b"mmp4"}
+_FFPROBE_TIMEOUT_SECONDS = 10
+
+
+def _read_duration_seconds(body: bytes) -> tuple[float | None, str | None]:
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        return None, "ffprobe not found on PATH"
+
+    # mkstemp, not NamedTemporaryFile: ffprobe opens this path itself while
+    # our own handle would still be live otherwise, and on Windows a second
+    # process can't open a file the first still holds open for writing. The
+    # fd is closed (the `with` below) before ffprobe ever touches the path,
+    # and the file is unlinked by hand once ffprobe is done with it either way.
+    fd, path = tempfile.mkstemp(suffix=".mp4")
+    try:
+        with os.fdopen(fd, "wb") as tmp:
+            tmp.write(body)
+        try:
+            proc = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_FFPROBE_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return None, "ffprobe timed out"
+    finally:
+        os.unlink(path)
+
+    output = proc.stdout.strip()
+    if proc.returncode != 0 or not output:
+        return None, "ffprobe could not determine duration"
+    try:
+        return float(output), None
+    except ValueError:
+        return None, "ffprobe could not determine duration"
+
+
+@register("video/mp4")
+class VideoHandler(Handler):
+    kind = "video"
+    directory = "videos"
+    extension = "mp4"
+
+    def sniff(self, body: bytes) -> bool:
+        return body[4:8] == _FTYP_MAGIC and body[8:12] in _MP4_BRANDS
+
+    def handle(self, body: bytes, url: str) -> HandlerResult:
+        duration_seconds, reason = _read_duration_seconds(body)
+        metadata: dict[str, object] = {"file_size": len(body), "duration_seconds": duration_seconds}
+        if reason is not None:
+            metadata["duration_unavailable_reason"] = reason
+        return HandlerResult(metadata=metadata, links=[])
+
+===== src\crawler\handlers\__init__.py =====
+"""Registers every concrete handler by importing it — see base.py's
+registry and its `@register` decorator. A handler module that isn't
+imported here never registers itself, and silently matches nothing; this
+is the one place a fifth handler's file has to be named, alongside its new
+file and its one `@register(...)` decorator.
+"""
+
+from . import html as _html  # noqa: F401 — imported for its @register side effect
+from . import image as _image  # noqa: F401 — imported for its @register side effect
+from . import pdf as _pdf  # noqa: F401 — imported for its @register side effect
+from . import video as _video  # noqa: F401 — imported for its @register side effect
+
+===== src\crawler\store\blobs.py =====
+"""Writes a fetched body to disk, named by content — see CLAUDE.md's blob
+naming decision. Pure filesystem and hashing, no database access: the
+per-url transaction in worker.py never waits on a syscall to open it, and
+this module has no idea `contents` exists.
+"""
+
+import hashlib
+import re
+from pathlib import Path
+from urllib.parse import urlsplit
+
+_HASH_PREFIX_LEN = 12
+_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _slug(url: str) -> str:
+    path = urlsplit(url).path
+    slug = _SLUG_RE.sub("-", path.lower()).strip("-")
+    return slug or "index"
+
+
+def write(output_dir: Path, directory: str, extension: str, url: str, body: bytes) -> tuple[str, str]:
+    """Writes `body` under `output_dir/directory/`, named by the first
+    twelve characters of its sha256 plus a slug from `url`'s path. Returns
+    `(content_hash, storage_path)` — the caller inserts both into
+    `contents` inside its own transaction; this function never touches the
+    database.
+
+    Idempotent: identical bytes for a different url land on the same path,
+    a no-op if it's already there rather than a second write.
+    """
+    content_hash = hashlib.sha256(body).hexdigest()
+    target_dir = output_dir / directory
+    target_dir.mkdir(parents=True, exist_ok=True)
+    path = target_dir / f"{content_hash[:_HASH_PREFIX_LEN]}-{_slug(url)}.{extension}"
+    if not path.exists():
+        path.write_bytes(body)
+    return content_hash, str(path)
+
+===== src\crawler\store\db.py =====
+"""The connection pool, and a migration runner guarded by a session-level
+advisory lock — under `docker compose up`, the crawler container can start
+more than one process against a fresh database, and only one of them should
+run `CREATE TABLE`. The loser blocks on the lock, not on a duplicate-object
+error.
+"""
+
+import logging
+from pathlib import Path
+
+import asyncpg
+
+from ..config import Config
+from ..logging import bind
+
+logger = logging.getLogger(__name__)
+
+# Arbitrary, fixed for this application's lifetime — pg_advisory_lock keys
+# are just a shared namespace both sides have to agree on ahead of time.
+_MIGRATION_LOCK_KEY = 84_902_113_775
+
+_SCHEMA_MIGRATIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    filename   TEXT PRIMARY KEY,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+)
+"""
+
+
+async def create_pool(config: Config) -> asyncpg.Pool:
+    return await asyncpg.create_pool(config.database_url)
+
+
+async def run_migrations(pool: asyncpg.Pool, migrations_dir: Path) -> None:
+    """Applies every `*.sql` file in `migrations_dir`, in filename order,
+    that isn't already recorded in `schema_migrations`. Holds one connection
+    for the advisory lock's whole session so a concurrent caller genuinely
+    blocks until this one releases it, rather than racing to create
+    `schema_migrations` itself.
+    """
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT pg_advisory_lock($1)", _MIGRATION_LOCK_KEY)
+        try:
+            await conn.execute(_SCHEMA_MIGRATIONS_TABLE)
+            applied = {
+                row["filename"]
+                for row in await conn.fetch("SELECT filename FROM schema_migrations")
+            }
+
+            for path in sorted(migrations_dir.glob("*.sql")):
+                if path.name in applied:
+                    continue
+                async with conn.transaction():
+                    await conn.execute(path.read_text(encoding="utf-8"))
+                    await conn.execute(
+                        "INSERT INTO schema_migrations (filename) VALUES ($1)", path.name
+                    )
+                with bind(migration=path.name):
+                    logger.info("applied migration")
+        finally:
+            await conn.execute("SELECT pg_advisory_unlock($1)", _MIGRATION_LOCK_KEY)
+
+===== src\crawler\store\frontier.py =====
+"""The frontier: claim, finish, enqueue. Every write is one SQL statement —
+the atomicity that matters (bump attempts and take the lease; new URLs vs
+known ones) happens inside Postgres, not across a read and a write here.
+See DESIGN.md for the SKIP LOCKED and snapshot-timing mechanics.
+
+Every function here takes `conn: asyncpg.Connection`, never a `Pool` — a
+`Pool` also has `.execute`/`.fetch`, which is exactly why it's the wrong
+type: it would let this module silently open its own connection (and its
+own implicit transaction) per call, hiding whether a write is the claim's
+own short transaction or part of the caller's longer-lived one. The pool
+stays at the edges (engine.py, cli.py); the caller decides which connection
+a write lands on, and whether it shares one with any other write here.
+
+Nothing here reads config.max_attempts — that's fetch/retry.py's call;
+this module only writes the decision it's handed.
+
+Every write that could land on a row this caller no longer owns — every
+terminal status, and giving a lease back early — is fenced on the
+`lease_token` claim_batch minted at claim time. See claim_batch's docstring
+for why an id alone isn't enough.
+"""
+
+import logging
+import uuid
+from dataclasses import dataclass
+
+import asyncpg
+
+from ..config import Config
+from ..errors import ErrorKind
+from ..fetch.retry import GiveUp, RetryAt
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimedUrl:
+    id: int
+    url: str
+    depth: int
+    attempt_no: int
+    etag: str | None
+    lease_token: uuid.UUID
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveredLink:
+    raw_url: str
+    normalized_url: str
+    anchor_text: str | None
+    # True for an img/video/source/embed src: a leaf, fetched regardless of
+    # host (CLAUDE.md's off-host-assets decision). False (the default) for
+    # an a[href], which worker.py still gates on in_scope.
+    is_asset: bool = False
+
+
+def _warn_if_lost_race(result: str, url_id: int, action: str) -> None:
+    """A terminal write matching zero rows means this lease is no longer
+    current — expired and reclaimed while this worker was still mid-flight,
+    so the row now belongs to whoever holds the new lease_token. Not a
+    bug: it's the race this fencing exists to lose safely instead of
+    overwriting the new owner's work. Logged, not raised — there's nothing
+    to retry or clean up, the row is already someone else's problem now.
+    """
+    if int(result.split()[-1]) == 0:
+        logger.warning(f"{action}: lease race lost, no row updated (url_id={url_id})")
+
+
+async def claim_batch(conn: asyncpg.Connection, limit: int, config: Config) -> list[ClaimedUrl]:
+    """One statement, its own implicit transaction: SKIP LOCKED claims up to
+    `limit` pending rows nobody else is touching, bumps `attempts`, sets the
+    lease, and mints a fresh `lease_token` on exactly those rows in the
+    same pass, committing the moment it returns — the lease has to be
+    visible to every other worker and to the supervisor immediately, not
+    held open behind whatever the caller does next.
+
+    The token, not the id, is what a terminal write is fenced on:
+    `recover_expired_leases` resets an expired row's status to `pending`
+    without knowing whether the worker that held it is still running —
+    still mid-fetch, unaware its lease is gone. That worker's own eventual
+    mark_done/mark_failed would otherwise land on whatever's claimed the
+    row since, silently overwriting a second worker's terminal write with
+    a first worker's stale one. Minting a new token on every claim, always,
+    regardless of the row's previous value, is what makes the stale
+    worker's write fail to match instead.
+
+    `pending` only — an `OR`'d-in `in_progress` branch forced a BitmapOr
+    across both partial indexes, which can't preserve `next_attempt_at`
+    order, so `ORDER BY` fell back to sorting every eligible row before
+    `LIMIT` could cut it down (verified via EXPLAIN; see DESIGN.md). now()
+    is Postgres's clock, not this process's, on purpose.
+    """
+    rows = await conn.fetch(
+        """
+        UPDATE urls
+        SET status = 'in_progress',
+            attempts = attempts + 1,
+            lease_until = now() + make_interval(secs => $2),
+            lease_token = gen_random_uuid(),
+            updated_at = now()
+        WHERE id IN (
+            SELECT id FROM urls
+            WHERE status = 'pending' AND next_attempt_at <= now()
+            ORDER BY next_attempt_at
+            FOR UPDATE SKIP LOCKED
+            LIMIT $1
+        )
+        RETURNING id, normalized_url, depth, attempts, etag, lease_token
+        """,
+        limit,
+        config.lease_seconds,
+    )
+    return [
+        ClaimedUrl(
+            id=r["id"],
+            url=r["normalized_url"],
+            depth=r["depth"],
+            attempt_no=r["attempts"],
+            etag=r["etag"],
+            lease_token=r["lease_token"],
+        )
+        for r in rows
+    ]
+
+
+async def recover_expired_leases(conn: asyncpg.Connection) -> int:
+    """Resets every `in_progress` row whose lease has lapsed back to
+    `pending`, as its own statement run periodically — not folded into
+    `claim_batch`, see its docstring. Doesn't touch `attempts`, same as
+    `release`: only `claim_batch`'s own `UPDATE` ever increments it, so a
+    row recovered here costs exactly one attempt on its next claim, no
+    more, regardless of which of `release`/retry/this path sent it back to
+    `pending`. Leaves `lease_token` alone — the stale worker still holds
+    the old value in memory, and claim_batch always mints a new one on the
+    next claim regardless of what's there now, which is all the fencing
+    needs.
+    """
+    result = await conn.execute(
+        """
+        UPDATE urls
+        SET status = 'pending', lease_until = NULL, updated_at = now()
+        WHERE status = 'in_progress' AND lease_until < now()
+        """
+    )
+    return int(result.split()[-1])
+
+
+async def crawl_complete(conn: asyncpg.Connection) -> bool:
+    """True once no url is `pending` or `in_progress` — the fixed point past
+    which nothing could ever add more work: only an `in_progress` row's own
+    commit can insert a new `pending` row (via `enqueue_many`), and if none
+    are `in_progress` there's no such commit left to happen. The engine's
+    supervisor polls this to recognize a finished crawl the same way it
+    recognizes a signal — both end the run through the same stop event.
+    """
+    row = await conn.fetchrow(
+        "SELECT NOT EXISTS (SELECT 1 FROM urls WHERE status IN ('pending', 'in_progress')) AS complete"
+    )
+    return row["complete"]
+
+
+async def status_counts(conn: asyncpg.Connection) -> dict[str, int]:
+    """Every status currently present in `urls`, with its row count. A
+    status nothing has reached yet just doesn't appear — a caller that
+    needs a fixed set (engine.py's progress line, `crawler stats`)
+    defaults the ones it asks for.
+    """
+    rows = await conn.fetch("SELECT status, count(*) FROM urls GROUP BY status")
+    return {r["status"]: r["count"] for r in rows}
+
+
+async def mark_done(
+    conn: asyncpg.Connection,
+    url_id: int,
+    lease_token: uuid.UUID,
+    *,
+    content_type: str | None,
+    content_length: int | None,
+    content_hash: str | None,
+    etag: str | None,
+) -> str | None:
+    """Records what landed, and returns the row's own `content_hash` from
+    immediately before this write — `None` on a url's first successful
+    fetch, the prior hash on a revisit. The caller uses that to tell a
+    first fetch from a revisit, and (comparing it to `content_hash`) an
+    unchanged revisit from a changed one, entirely from this return value
+    — no second query.
+
+    `content_changed_at` moves to now() in the same statement, exactly
+    when that prior hash is non-null and differs from the new one. A CTE
+    reads the pre-update row once; the UPDATE's own SET could compare
+    against it unqualified without one (Postgres evaluates SET against the
+    pre-update row), but RETURNING only ever sees the row after — so
+    getting the prior hash *out* needs the CTE regardless.
+
+    `prior` is a snapshot taken at the start of this statement, in
+    principle stale by the time the UPDATE locks the row — but that
+    window can't actually land a wrong comparison here. `content_hash` is
+    only ever written by this function, always gated on `lease_token`
+    matching, and a given token is only ever valid for one caller at a
+    time (freshly minted, once, by the claim_batch call that handed it
+    out). Nothing else can be concurrently writing `content_hash` on this
+    row under the same token while this statement runs, so the value
+    `prior` captured is still exactly what's about to be overwritten.
+    """
+    row = await conn.fetchrow(
+        """
+        WITH prior AS (
+            SELECT content_hash FROM urls WHERE id = $1 AND lease_token = $2
+        )
+        UPDATE urls
+        SET status = 'done', content_type = $3, content_length = $4,
+            content_hash = $5, etag = $6,
+            content_changed_at = CASE
+                WHEN prior.content_hash IS NOT NULL AND prior.content_hash IS DISTINCT FROM $5
+                    THEN now()
+                ELSE urls.content_changed_at
+            END,
+            lease_until = NULL, last_seen_at = now(), updated_at = now()
+        FROM prior
+        WHERE urls.id = $1 AND urls.lease_token = $2
+        RETURNING prior.content_hash AS previous_hash
+        """,
+        url_id,
+        lease_token,
+        content_type,
+        content_length,
+        content_hash,
+        etag,
+    )
+    if row is None:
+        logger.warning(f"mark_done: lease race lost, no row updated (url_id={url_id})")
+        return None
+    return row["previous_hash"]
+
+
+async def mark_unchanged(conn: asyncpg.Connection, url_id: int, lease_token: uuid.UUID) -> None:
+    """A conditional hit: empty body, `ETag` matching what's already on the
+    row. `content_type`/`content_length`/`content_hash`/`etag` from the
+    prior visit are still correct, so only `last_seen_at` moves — see
+    CLAUDE.md's conditional-request decision.
+    """
+    result = await conn.execute(
+        """
+        UPDATE urls
+        SET status = 'done', lease_until = NULL, last_seen_at = now(), updated_at = now()
+        WHERE id = $1 AND lease_token = $2
+        """,
+        url_id,
+        lease_token,
+    )
+    _warn_if_lost_race(result, url_id, "mark_unchanged")
+
+
+async def mark_skipped(
+    conn: asyncpg.Connection,
+    url_id: int,
+    lease_token: uuid.UUID,
+    *,
+    content_type: str | None,
+    content_length: int | None,
+) -> None:
+    """A url whose content landed outside every registered handler — not a
+    failure (DESIGN.md: "unmatched content type"), so no error_kind, no
+    retry, no body written. What was observed still lands on the row even
+    though nothing was stored.
+    """
+    result = await conn.execute(
+        """
+        UPDATE urls
+        SET status = 'skipped', content_type = $3, content_length = $4,
+            lease_until = NULL, last_seen_at = now(), updated_at = now()
+        WHERE id = $1 AND lease_token = $2
+        """,
+        url_id,
+        lease_token,
+        content_type,
+        content_length,
+    )
+    _warn_if_lost_race(result, url_id, "mark_skipped")
+
+
+async def mark_failed(
+    conn: asyncpg.Connection,
+    url_id: int,
+    lease_token: uuid.UUID,
+    decision: GiveUp | RetryAt,
+    error_kind: ErrorKind,
+    error_message: str | None = None,
+) -> None:
+    """Writes the retry decision fetch/retry.py already made — GiveUp ends
+    the row at 'failed', RetryAt sends it back to 'pending'. Doesn't touch
+    `attempts` — only claim_batch's statement ever increments it.
+    """
+    if isinstance(decision, GiveUp):
+        status, next_attempt_at = "failed", None
+    else:
+        status, next_attempt_at = "pending", decision.at
+
+    result = await conn.execute(
+        """
+        UPDATE urls
+        SET status = $3,
+            next_attempt_at = COALESCE($4, next_attempt_at),
+            lease_until = NULL,
+            error_kind = $5,
+            error_message = $6,
+            updated_at = now()
+        WHERE id = $1 AND lease_token = $2
+        """,
+        url_id,
+        lease_token,
+        status,
+        next_attempt_at,
+        error_kind.value,
+        error_message,
+    )
+    _warn_if_lost_race(result, url_id, "mark_failed")
+
+
+async def record_attempt(
+    conn: asyncpg.Connection,
+    url_id: int,
+    attempt_no: int,
+    *,
+    status_code: int | None,
+    elapsed: float,
+    error_kind: ErrorKind | None = None,
+) -> None:
+    """One row per fetch attempt — status_code and duration_ms, for
+    diagnosing which attempt did what. Deliberately its own statement, not
+    folded into mark_done/mark_failed: it's diagnostic, not crawl state, so
+    it doesn't need their atomicity, and doesn't need lease_token fencing
+    either — an attempt log entry from a stale worker is still an accurate
+    record of what that attempt actually did, unlike a terminal write.
+    """
+    await conn.execute(
+        """
+        INSERT INTO fetch_attempts (url_id, attempt_no, status_code, duration_ms, error_kind)
+        VALUES ($1, $2, $3, $4, $5)
+        """,
+        url_id,
+        attempt_no,
+        status_code,
+        round(elapsed * 1000),
+        error_kind.value if error_kind else None,
+    )
+
+
+async def release(conn: asyncpg.Connection, url_id: int, lease_token: uuid.UUID) -> None:
+    """Gives back a claimed row immediately, for a worker that took a lease
+    and never acted on it. Doesn't touch `attempts`.
+    """
+    result = await conn.execute(
+        """
+        UPDATE urls
+        SET status = 'pending', lease_until = NULL, updated_at = now()
+        WHERE id = $1 AND status = 'in_progress' AND lease_token = $2
+        """,
+        url_id,
+        lease_token,
+    )
+    _warn_if_lost_race(result, url_id, "release")
+
+
+async def enqueue_many(
+    conn: asyncpg.Connection, links: list[DiscoveredLink], depth: int, src_id: int | None = None
+) -> dict[str, int]:
+    """Inserts whichever `links` aren't already known, records an edge from
+    `src_id` to every one of them — new or already known — and returns
+    every url's id. Two statements, not one: see DESIGN.md — a single
+    INSERT-then-read CTE can miss a row a concurrent transaction commits
+    mid-statement.
+    """
+    normalized = [link.normalized_url for link in links]
+    raw = [link.raw_url for link in links]
+    anchors = [link.anchor_text for link in links]
+
+    await conn.execute(
+        """
+        INSERT INTO urls (normalized_url, raw_url, depth)
+        SELECT DISTINCT ON (normalized_url) normalized_url, raw_url, $3
+        FROM unnest($1::text[], $2::text[]) AS t (normalized_url, raw_url)
+        ON CONFLICT (normalized_url) DO NOTHING
+        """,
+        normalized,
+        raw,
+        depth,
+    )
+    rows = await conn.fetch(
+        """
+        WITH input AS (
+            SELECT * FROM unnest($1::text[], $2::text[]) AS t (normalized_url, anchor_text)
+        ),
+        resolved AS (
+            SELECT DISTINCT ON (u.normalized_url) u.id, u.normalized_url
+            FROM urls u JOIN input i ON i.normalized_url = u.normalized_url
+        ),
+        links_ins AS (
+            INSERT INTO links (src_id, dst_id, anchor_text)
+            SELECT $3, r.id, i.anchor_text
+            FROM input i JOIN resolved r ON r.normalized_url = i.normalized_url
+            WHERE $3::bigint IS NOT NULL
+            ON CONFLICT (src_id, dst_id) DO NOTHING
+        )
+        SELECT id, normalized_url FROM resolved
+        """,
+        normalized,
+        anchors,
+        src_id,
+    )
+    return {row["normalized_url"]: row["id"] for row in rows}
+
+===== src\crawler\store\metadata.py =====
+"""Persists what a blob is and what a handler found in it — both keyed by
+content_hash, so two urls that hash the same share one write, not two.
+Same connection-not-pool contract as frontier.py: both functions here run
+inside worker.py's per-url transaction, on the connection it passes in.
+"""
+
+import json
+
+import asyncpg
+
+
+async def insert_content(
+    conn: asyncpg.Connection,
+    content_hash: str,
+    content_type: str | None,
+    byte_size: int,
+    storage_path: str,
+) -> None:
+    """Registers a blob's hash the first time it's seen. `DO NOTHING` on a
+    repeat: identical bytes from a second url are already on disk under
+    this hash — see store/blobs.py — so there's nothing new to record.
+    """
+    await conn.execute(
+        """
+        INSERT INTO contents (content_hash, content_type, byte_size, storage_path)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (content_hash) DO NOTHING
+        """,
+        content_hash,
+        content_type,
+        byte_size,
+        storage_path,
+    )
+
+
+async def insert_metadata(
+    conn: asyncpg.Connection, content_hash: str, kind: str, payload: dict[str, object]
+) -> None:
+    """Registers one handler's extraction for a hash. `DO NOTHING` on a
+    repeat, same reasoning as insert_content: the same bytes extract the
+    same payload deterministically, so a second url with the same hash
+    never needs this redone.
+    """
+    await conn.execute(
+        """
+        INSERT INTO content_metadata (content_hash, kind, payload)
+        VALUES ($1, $2, $3::jsonb)
+        ON CONFLICT (content_hash) DO NOTHING
+        """,
+        content_hash,
+        kind,
+        json.dumps(payload),
+    )
+
+===== src\crawler\store\stats.py =====
+"""Read-only aggregate queries for `crawler stats` -- nothing here writes,
+and nothing in the live crawl calls it. status_counts is frontier.py's own;
+reused, not duplicated.
+"""
+
+from dataclasses import dataclass
+from datetime import datetime
+
+import asyncpg
+
+from . import frontier
+
+
+@dataclass(frozen=True, slots=True)
+class Stats:
+    status_counts: dict[str, int]
+    failure_reasons: dict[str, int]
+    attempts_total: int
+    urls_attempted: int
+    bytes_by_type: dict[str, int]
+    dedup_total: int
+    dedup_distinct: int
+    changed_count: int
+
+
+async def gather(conn: asyncpg.Connection, since: datetime | None = None) -> Stats:
+    """One read per line of the report -- small, independent aggregates
+    over urls/fetch_attempts/contents, not one query trying to say
+    everything. `since` narrows only `changed_count`; every other figure
+    describes the crawl's state as it stands right now, not a window.
+    """
+    status_counts = await frontier.status_counts(conn)
+
+    failure_rows = await conn.fetch(
+        "SELECT error_kind, count(*) AS n FROM urls WHERE status = 'failed' "
+        "GROUP BY error_kind ORDER BY n DESC"
+    )
+    failure_reasons = {r["error_kind"]: r["n"] for r in failure_rows}
+
+    pressure = await conn.fetchrow(
+        "SELECT count(*) AS attempts, count(DISTINCT url_id) AS urls FROM fetch_attempts"
+    )
+
+    bytes_rows = await conn.fetch(
+        "SELECT content_type, sum(byte_size) AS n FROM contents GROUP BY content_type ORDER BY n DESC"
+    )
+    bytes_by_type = {r["content_type"]: r["n"] for r in bytes_rows}
+
+    dedup = await conn.fetchrow(
+        "SELECT count(*) AS total, count(DISTINCT content_hash) AS distinct_hashes "
+        "FROM urls WHERE status = 'done'"
+    )
+
+    if since is None:
+        changed_count = await conn.fetchval(
+            "SELECT count(*) FROM urls WHERE content_changed_at IS NOT NULL"
+        )
+    else:
+        changed_count = await conn.fetchval(
+            "SELECT count(*) FROM urls WHERE content_changed_at IS NOT NULL AND content_changed_at > $1",
+            since,
+        )
+
+    return Stats(
+        status_counts=status_counts,
+        failure_reasons=failure_reasons,
+        attempts_total=pressure["attempts"],
+        urls_attempted=pressure["urls"],
+        bytes_by_type=bytes_by_type,
+        dedup_total=dedup["total"],
+        dedup_distinct=dedup["distinct_hashes"],
+        changed_count=changed_count,
+    )
+
+===== src\crawler\store\__init__.py =====
+
+===== migrations\001_init.sql =====
+-- Frontier state, content dedup, and the discovery graph. See CLAUDE.md:
+-- correctness lives here, not in process memory.
+
+-- One row per unique payload, keyed by its hash — "identical bytes from two
+-- urls are stored once". content_type/byte_size describe the stored blob;
+-- urls.content_type/content_length below describe what was *observed*,
+-- which still applies to a skipped url that was never downloaded at all.
+CREATE TABLE contents (
+    content_hash  TEXT PRIMARY KEY,
+    content_type  TEXT NOT NULL,
+    byte_size     BIGINT NOT NULL,
+    storage_path  TEXT NOT NULL,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE urls (
+    id              BIGSERIAL PRIMARY KEY,
+
+    -- normalized_url is the identity: the conflict target, and what
+    -- actually gets fetched. raw_url is only ever set once, at insert, from
+    -- whichever spelling first produced the row — a debugging hint, not a
+    -- history of every variant seen.
+    normalized_url  TEXT NOT NULL UNIQUE,
+    raw_url         TEXT NOT NULL,
+
+    depth           INT NOT NULL DEFAULT 0,
+
+    -- TEXT + CHECK, not a native ENUM: adding a status later is a plain
+    -- migration, not an ALTER TYPE that can't run in the same transaction
+    -- as its first use — 'skipped' (DESIGN.md: unmatched content type)
+    -- isn't here yet because nothing writes it until the handler layer
+    -- exists to decide it; add it in the migration that adds that handler.
+    status          TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'in_progress', 'done', 'failed')),
+
+    -- Bumped only by claim_batch's own claiming statement — never by
+    -- whatever later sends the row back to 'pending' (retry, release).
+    attempts        INT NOT NULL DEFAULT 0,
+
+    -- Set on claim, cleared on every terminal write. A lease that's simply
+    -- aged past lease_until, with no worker coming back for it, is what a
+    -- crashed worker leaves behind — see store/frontier.py's
+    -- recover_expired_leases.
+    lease_until     TIMESTAMPTZ,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    content_type    TEXT,
+    content_length  BIGINT,
+    content_hash    TEXT REFERENCES contents (content_hash),
+    etag            TEXT,
+
+    error_kind      TEXT,
+    error_message   TEXT,
+
+    discovered_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at    TIMESTAMPTZ,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- claim_batch and mark_* only ever scan or touch one status at a time; a
+-- partial index keeps that scan small as 'done'/'failed' rows pile up,
+-- instead of growing with the whole table.
+CREATE INDEX urls_pending_idx ON urls (next_attempt_at) WHERE status = 'pending';
+CREATE INDEX urls_in_progress_idx ON urls (lease_until) WHERE status = 'in_progress';
+
+-- Per-type extraction, keyed by content_hash like `contents` — two urls
+-- sharing bytes share the extraction too, so it's never redone or
+-- duplicated for a second url that happens to hash the same.
+CREATE TABLE content_metadata (
+    content_hash TEXT PRIMARY KEY REFERENCES contents (content_hash),
+    kind         TEXT NOT NULL,
+    payload      JSONB NOT NULL
+);
+
+-- The discovery graph: which page linked to which, with what anchor text.
+-- PRIMARY KEY (src_id, dst_id) means the edge is deduplicated by endpoints
+-- alone: if the same page links to the same target twice with different
+-- anchor text, ON CONFLICT DO NOTHING in enqueue_many keeps only the first
+-- anchor text seen and silently drops the second. Acknowledged, not fixed —
+-- the alternative is a row per (src, dst, anchor), which turns "did A link
+-- to B" into a query over duplicates for no reader who's asked for one yet.
+CREATE TABLE links (
+    src_id      BIGINT NOT NULL REFERENCES urls (id),
+    dst_id      BIGINT NOT NULL REFERENCES urls (id),
+    anchor_text TEXT,
+    PRIMARY KEY (src_id, dst_id)
+);
+
+-- One row per fetch attempt: status_code and duration_ms, for diagnosing
+-- *which* attempt did what. urls.attempts is the hot counter claim_batch
+-- bumps in the same statement as the lease; this is the append-only detail
+-- an aggregate can't hold without becoming multi-valued.
+CREATE TABLE fetch_attempts (
+    id          BIGSERIAL PRIMARY KEY,
+    url_id      BIGINT NOT NULL REFERENCES urls (id),
+    attempt_no  INT NOT NULL,
+    status_code INT,
+    duration_ms INT,
+    error_kind  TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX fetch_attempts_url_id_idx ON fetch_attempts (url_id);
+
+===== migrations\002_skipped_status.sql =====
+-- Adds 'skipped' now that the handler layer exists to decide it — see
+-- 001_init.sql's comment on urls.status, and DESIGN.md's "unmatched
+-- content type" decision. A plain ALTER, not a native-ENUM change: exactly
+-- the case the TEXT + CHECK choice was made for.
+
+ALTER TABLE urls DROP CONSTRAINT urls_status_check;
+ALTER TABLE urls ADD CONSTRAINT urls_status_check
+    CHECK (status IN ('pending', 'in_progress', 'done', 'failed', 'skipped'));
+
+-- Fences a terminal write to the claim that actually made it. claim_batch
+-- alone doesn't stop two workers from both holding what they each think is
+-- the current claim on one row: a worker whose lease expired gets its row
+-- reset to 'pending' by recover_expired_leases and reclaimed by someone
+-- else, but the first worker doesn't know that — it's still mid-fetch,
+-- and without something to check against, its eventual mark_done would
+-- overwrite whatever the second worker already wrote. gen_random_uuid()
+-- is core Postgres since 13, no extension needed.
+ALTER TABLE urls ADD COLUMN IF NOT EXISTS lease_token UUID;
+
+===== migrations\003_content_changed_at.sql =====
+-- Tracks when a revisit's body actually differs from what was already on
+-- the row, instead of mark_done silently overwriting content_hash every
+-- time. Null until the first real change; a same-hash revisit or a url's
+-- first-ever successful fetch never touches it. A column, not a
+-- content_changes table: there's no runs table, so "which urls changed
+-- between two points in time" is content_changed_at > that boundary either
+-- way, and a history table nothing queries is dead weight.
+ALTER TABLE urls ADD COLUMN content_changed_at TIMESTAMPTZ;
+
