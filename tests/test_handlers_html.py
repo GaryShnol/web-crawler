@@ -1,6 +1,7 @@
 """handlers/html.py: sniffing by magic bytes (never the declared header or
-the url), and link extraction with resolution against the page's own url.
-Pure — no I/O, so these run with no fixtures at all.
+the url), link extraction (both `a[href]` and asset `src`) with resolution
+against the page's own url, and the title/link_count metadata. Pure — no
+I/O, so these run with no fixtures at all.
 """
 
 from fake_api.payloads import tiny_pdf, tiny_png
@@ -43,9 +44,9 @@ class TestHandle:
         )
         result = HANDLER.handle(body, "http://fixture.local/page")
 
-        assert result.metadata is None
         urls = {link.normalized_url for link in result.links}
         assert urls == {"http://fixture.local/a", "http://fixture.local/b"}
+        assert result.metadata["link_count"] == 2
 
     def test_anchor_text_is_captured_and_stripped(self):
         body = b'<html><body><a href="http://fixture.local/a">  hello world  </a></body></html>'
@@ -81,3 +82,63 @@ class TestHandle:
         [link] = HANDLER.handle(body, "http://fixture.local/page").links
         assert link.raw_url == "/b?x=1"
         assert link.normalized_url == "http://fixture.local/b?x=1"
+
+    def test_href_link_is_not_an_asset(self):
+        [link] = HANDLER.handle(b'<a href="/a">a</a>', "http://fixture.local/").links
+        assert link.is_asset is False
+
+    def test_asset_src_urls_are_extracted_as_links(self):
+        body = (
+            b"<html><body>"
+            b'<img src="/logo.png">'
+            b'<video src="/clip.mp4"></video>'
+            b'<source src="/clip.webm">'
+            b'<embed src="/doc.pdf">'
+            b"</body></html>"
+        )
+        result = HANDLER.handle(body, "http://fixture.local/page")
+        urls = {link.normalized_url for link in result.links}
+        assert urls == {
+            "http://fixture.local/logo.png",
+            "http://fixture.local/clip.mp4",
+            "http://fixture.local/clip.webm",
+            "http://fixture.local/doc.pdf",
+        }
+        assert all(link.is_asset for link in result.links)
+        assert all(link.anchor_text is None for link in result.links)
+
+    def test_asset_without_src_is_skipped(self):
+        assert HANDLER.handle(b"<html><body><img></body></html>", "http://fixture.local/").links == []
+
+    def test_offhost_asset_src_is_still_extracted(self):
+        # Host restriction is worker.py's call (is_asset bypasses it there) --
+        # the handler extracts every asset src regardless of host.
+        [link] = HANDLER.handle(
+            b'<img src="http://cdn.local/logo.png">', "http://fixture.local/"
+        ).links
+        assert link.normalized_url == "http://cdn.local/logo.png"
+        assert link.is_asset is True
+
+
+class TestMetadata:
+    def test_title_and_link_count(self):
+        body = (
+            b"<html><head><title>  Example Page  </title></head>"
+            b'<body><a href="/a">a</a><img src="/b.png"></body></html>'
+        )
+        result = HANDLER.handle(body, "http://fixture.local/")
+        assert result.metadata == {"title": "Example Page", "link_count": 2}
+
+    def test_missing_title_is_none(self):
+        body = b"<html><body>no title here</body></html>"
+        result = HANDLER.handle(body, "http://fixture.local/")
+        assert result.metadata["title"] is None
+
+    def test_empty_title_is_none(self):
+        body = b"<html><head><title></title></head><body></body></html>"
+        result = HANDLER.handle(body, "http://fixture.local/")
+        assert result.metadata["title"] is None
+
+    def test_page_with_no_links_has_zero_link_count(self):
+        result = HANDLER.handle(b"<html><body>no links</body></html>", "http://fixture.local/")
+        assert result.metadata["link_count"] == 0

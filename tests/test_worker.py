@@ -5,6 +5,7 @@ test_fetch_client.py: the thing worth testing is what actually lands in
 the frontier, not what a mock was told to return.
 """
 
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -106,9 +107,10 @@ class TestSuccessHtml:
         assert Path(content_row["storage_path"]).read_bytes().startswith(b"<html>")
 
         metadata_row = await pool.fetchrow(
-            "SELECT 1 FROM content_metadata WHERE content_hash = $1", row["content_hash"]
+            "SELECT kind, payload FROM content_metadata WHERE content_hash = $1", row["content_hash"]
         )
-        assert metadata_row is None  # html handler extracts links only, this session
+        assert metadata_row["kind"] == "page"
+        assert json.loads(metadata_row["payload"]) == {"title": None, "link_count": 2}
 
         child = await pool.fetchrow(
             "SELECT status, depth FROM urls WHERE normalized_url = $1", in_scope_link
@@ -160,6 +162,25 @@ class TestSkipped:
         assert row["error_kind"] is None
 
         assert list(tmp_path.iterdir()) == []  # nothing was written to disk
+
+
+class TestUnparseableContent:
+    async def test_sniff_matching_but_corrupt_body_is_retried_not_a_crash(self, pool, tmp_path):
+        # Real PNG magic bytes (passes ImageHandler.sniff), but no valid PNG
+        # chunk stream behind them — Pillow raises inside handler.handle().
+        page = "http://fixture.local/corrupt.png"
+        body = b"\x89PNG\r\n\x1a\n" + b"not a real png chunk stream"
+        routes = {page: [FakeResponse(200, {"Content-Type": "image/png"}, body)]}
+        url_id, _ = await _process(pool, page, routes, tmp_path, max_attempts=5)
+
+        row = await _row(pool, url_id)
+        assert row["status"] == "pending"  # temporary failure: retried, not given up on
+        assert row["error_kind"] == "unparseable_content"
+        assert row["content_hash"] is None  # handler.handle() raised before blobs.write ran
+        assert row["next_attempt_at"] is not None
+
+        assert list(tmp_path.iterdir()) == []  # nothing written to disk
+        assert await pool.fetchval("SELECT count(*) FROM contents") == 0
 
 
 class TestFailures:
