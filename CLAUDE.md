@@ -116,9 +116,14 @@ and its findings are being worked through.
 All three adversarial-review findings are closed, and `tests/fake_api/` no
 longer only generates responses the code handles well: every fixture below
 is reachable from the seed page and driven end to end by `test_engine.py`'s
-`test_full_fixture_graph_crawls_clean` — the first test to run `engine.run()`
-over `site.build_routes()`'s whole graph at all, rather than an ad-hoc
-single-URL route dict. `MISSING_CONTENT_TYPE` (no `Content-Type` header),
+`test_full_fixture_graph_crawls_clean_then_a_restart_touches_nothing` — the
+first test to run `engine.run()` over `site.build_routes()`'s whole graph at
+all, rather than an ad-hoc single-URL route dict; also the only test proving
+a second run against an already-fully-drained database does nothing (exit 0
+alone doesn't say that — every url's `attempts`/`content_hash`/
+`last_seen_at` staying byte-identical is the actual claim, `last_seen_at`
+the sharpest of the three since it only moves inside a real claim).
+`MISSING_CONTENT_TYPE` (no `Content-Type` header),
 `REDIRECT` (a 3xx with `Location`), `STATUS_404`/`STATUS_403` (permanent,
 one attempt), `STATUS_500`/`STATUS_429_WITH_RETRY_AFTER` (transient, driven
 to `max_attempts`), `MALFORMED_ENVELOPE` (not valid JSON — see

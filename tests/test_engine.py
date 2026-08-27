@@ -356,7 +356,9 @@ class TestRunEndToEnd:
         assert lines[0].context["done"] == 1
         assert lines[0].context["pending"] == 0
 
-    async def test_full_fixture_graph_crawls_clean(self, pool, tmp_path):
+    async def test_full_fixture_graph_crawls_clean_then_a_restart_touches_nothing(
+        self, pool, tmp_path, caplog
+    ):
         """site.py's own graph, actually driven through engine.run() rather
         than just asserted to exist (test_fake_api.py's job) or fed to a
         handler directly (test_handlers_*.py's). This is what catches a
@@ -364,7 +366,18 @@ class TestRunEndToEnd:
         sniff-only match, no Content-Type header at all -- reaching
         insert_content and hitting contents.content_type NOT NULL, which no
         unit test calling insert_content directly would ever have driven.
+
+        Second half: what a reviewer actually does with docker-compose.yml's
+        crawl-db volume -- run the stack again against a database that's
+        already fully drained. No test anywhere else covers this; the
+        two-run change-detection table in the README covers the opposite
+        property (every url reset to pending first, forcing a revisit).
+        Runs with the fake_api server already torn down, deliberately: if
+        the second run ever tried to fetch anything at all, it would fail
+        loudly against a dead server rather than silently succeeding against
+        a live one that happens to still be running.
         """
+        caplog.set_level(logging.INFO, logger="crawler.engine")
         routes = site.build_routes()
         async with _running(routes) as server:
             config = Config(
@@ -440,6 +453,30 @@ class TestRunEndToEnd:
         assert recovered["status"] == "done"
         assert recovered["attempts"] == 3
 
+        # Restart: same config, same database, frontier already fully
+        # drained. caplog.clear() so the "crawl stopped" line asserted below
+        # is this run's own, not run 1's leftover record.
+        before = await _snapshot(pool)
+        files_before = _all_files(tmp_path)
+        caplog.clear()
+        second_exit_code = await asyncio.wait_for(run(config, sleep=_instant_sleep), timeout=10)
+
+        assert second_exit_code == 0  # worthless alone -- exit 0 doesn't say nothing ran
+
+        lines = [r for r in caplog.records if r.getMessage() == "crawl stopped"]
+        assert len(lines) == 1
+        assert lines[0].context["reason"] == "drain"  # recognized on sight, not by falling through
+
+        after = await _snapshot(pool)
+        assert after == before  # the assertion that actually carries this test:
+        # attempts unchanged means nothing was reclaimed; content_hash
+        # unchanged means nothing was re-fetched; last_seen_at unchanged is
+        # the sharpest of the three -- it only ever moves inside mark_done/
+        # mark_unchanged, so if it didn't move, no url was claimed at all,
+        # not even into a same-hash no-op write.
+
+        assert _all_files(tmp_path) == files_before  # zero blob writes, not just zero new ones
+
     async def test_a_missing_seed_url_is_rejected_before_touching_the_pool(self):
         config = Config(database_url=TEST_DATABASE_URL, fetch_api_url="http://unused/unused")
         with pytest.raises(ValueError, match="seed_url"):
@@ -452,6 +489,24 @@ def _config() -> Config:
         database_url="postgresql://unused/unused",
         fetch_api_url="http://unused/unused",
     )
+
+
+async def _snapshot(pool) -> dict[str, tuple]:
+    """Local, not shared with test_resumability.py's near-identical
+    _final_state -- four lines duplicated across two files is cheaper than a
+    conftest export coupling both to one shape neither otherwise needs.
+    """
+    rows = await pool.fetch(
+        "SELECT normalized_url, status, attempts, content_hash, last_seen_at FROM urls"
+    )
+    return {
+        r["normalized_url"]: (r["status"], r["attempts"], r["content_hash"], r["last_seen_at"])
+        for r in rows
+    }
+
+
+def _all_files(root) -> set:
+    return {p for p in root.rglob("*") if p.is_file()}
 
 
 async def _assert_failed(

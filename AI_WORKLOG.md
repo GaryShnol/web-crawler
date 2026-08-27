@@ -102,8 +102,10 @@ since feature 1, referenced by a link-resolution smoke test and by handler unit
 tests calling into it directly — but every end-to-end test in `test_engine.py`
 built its own single-url route dict rather than crawling the graph. A response
 class that has to be *reachable from the seed page* to matter therefore had no
-test that would ever drive it. `test_full_fixture_graph_crawls_clean` is the
-first crawl over the whole graph, and it caught `contents.content_type NOT NULL`
+test that would ever drive it. The test that closed this gap (later renamed
+`test_full_fixture_graph_crawls_clean_then_a_restart_touches_nothing`, once a
+second property landed in it) is the first crawl over the whole graph, and it
+caught `contents.content_type NOT NULL`
 on a header-less body that `sniff` matched anyway — a path no unit test calling
 `insert_content` directly could reach. The remaining gaps (a redirect, the 4xx
 and 5xx routes, a malformed envelope) land the same way: a route, a link from

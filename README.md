@@ -16,6 +16,11 @@ once the frontier drains. `tests/fake_api/` is a test double for offline
 development, not an implementation of the fetch service the assignment
 specifies.
 
+Crawl state is inspectable during and after a run: `make psql`, or any
+client against `localhost:55433` (user `postgres`, password `crawler`,
+database `crawler`). `urls` carries per-url status, attempt count, and
+failure reason; `crawler stats` summarises the same rows.
+
 ## Key decisions
 
 **Frontier: Postgres, not a queue.** `FOR UPDATE SKIP LOCKED` claims a url
