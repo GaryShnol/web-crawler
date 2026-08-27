@@ -104,9 +104,11 @@ below `FetchResponse` only ever knows `bytes | None`.
 Data volume: `claim_batch`'s `pending`-only index scan is what keeps a
 claim cheap as `done` rows pile into the millions — confirmed with
 `EXPLAIN (ANALYZE, BUFFERS)` at 50k/2k rows, not load-tested past that.
-The output tree and its per-type `index.jsonl` stop being enough past a
-few million objects; that's when the blob store moves to S3/GCS, addressed
-by the same content hash, with Postgres keeping only the pointer.
+The output tree itself — a flat directory per type, no index file alongside
+it — stops being enough past a few million objects; `urls.content_hash` in
+Postgres is what already maps a stored file back to the URLs that produced
+it, so moving the blob store to S3/GCS at that point is addressed by the
+same content hash, with Postgres keeping only the pointer.
 Reliability wants the lease-renewal fix below: without it, more
 concurrency just means more chances for a live worker's real processing
 time to outrun its fixed lease deadline, which it has no way to extend.

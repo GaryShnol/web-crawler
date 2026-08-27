@@ -109,6 +109,14 @@ on a header-less body that `sniff` matched anyway — a path no unit test callin
 and 5xx routes, a malformed envelope) land the same way: a route, a link from
 the seed page, an assertion in that test.
 
+A different kind of miss surfaced in the closing pass over the delivered
+docs: two decisions written down early — a per-type `index.jsonl`, SVG
+dimensions stored null with a reason — were never built, and stayed
+documented as fact in `CLAUDE.md`, then inherited forward into `DESIGN.md`
+and `README.md` without either ever being checked against the code. Neither
+regressed; both were true the day they were written and false ever after.
+Catching that is what the closing pass is for.
+
 ## Where I was wrong
 
 I challenged the claim that `INSERT ... ON CONFLICT DO NOTHING` raises a

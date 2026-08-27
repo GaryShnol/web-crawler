@@ -317,9 +317,12 @@ and readable enough that opening the folder tells you something. I skipped
 hardlinking a content-addressed store into a browsable one because that breaks
 across filesystems and behaves badly in Docker on Windows, which is where this
 has to run. Identical bytes from two URLs are stored once, so the folder alone
-can't tell you the site structure — `urls.content_hash` in the database does,
-and each type directory also gets an `index.jsonl` mapping file to hash to the
-URLs that produced it.
+can't tell you the site structure — `urls.content_hash` in the database is
+what maps a stored file back to the URLs that produced it. A per-type
+`index.jsonl` restating that same mapping on disk was considered and dropped
+before it was ever built: it would be the exact two-writes-one-fact problem
+the no-broker decision above already rules out, just relocated to the
+filesystem.
 
 **Two spellings of the same URL stay two URLs.** I normalize the things nobody
 argues about — fragment, scheme and host casing, default ports, `../`,
@@ -371,13 +374,14 @@ image, video, and PDF, the URL is recorded as `skipped`: no error kind, no
 retry, no body written. `content_type` and `content_length` are kept on the
 row so what was seen is still visible without having downloaded it.
 
-**A field that's legitimately unknowable isn't a failure either.** An SVG can
-be well-formed with no `width`/`height` and no `viewBox` — no intrinsic size
-to read, off the root or anywhere else. When that happens `width` and `height`
-are stored `null` with a reason, `file_size` is stored as usual, and nothing
-about the row says failure. Same shape as video duration when `ffprobe` isn't
-on the `PATH`: the content is real and stored, one field is genuinely absent,
-and that's a fact worth recording, not an error worth retrying.
+**A field that's legitimately unknowable isn't a failure either.** A video's
+duration is unreadable when `ffprobe` isn't on the `PATH`, or is but the
+container has nothing in it to read — no exception, just nothing to report.
+When that happens `duration_seconds` is stored `null` with a
+`duration_unavailable_reason`, `file_size` is stored as usual, and nothing
+about the row says failure: the content is real and stored, one field is
+genuinely absent, and that's a fact worth recording, not an error worth
+retrying.
 
 If you think one of these is wrong, give me the argument before you change
 course.
@@ -387,8 +391,8 @@ course.
 Frontier and visited state, each URL's status — success, failure, or skipped
 for an unmatched content type — attempt count and failure reason, its next
 retry time and current lease, content hash and ETag, the per-type metadata
-(including a reason when an expected field like SVG dimensions or video
-duration is legitimately absent), and the discovery graph of which page linked
+(including a reason when an expected field like video duration is
+legitimately absent), and the discovery graph of which page linked
 to which. Enough to stop the crawler, inspect it, and start it again without
 losing or repeating work.
 
@@ -430,7 +434,7 @@ committed alongside the code.
 
 ```bash
 uv run ruff check
-grep -rn "status_code ==" src/   # should only ever match errors.py
+grep -rln "\.status_code" src/   # errors.py and worker.py, nothing else
 grep -rn "TODO" src/             # should be empty
 uv run pytest                    # frontier concurrency test, 20 runs, no flakes
 ```

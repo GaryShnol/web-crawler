@@ -38,11 +38,11 @@ responses correlated with a retryable fault.
 
 ## Unknowable field: null with a reason, not failure
 
-Chose null dimensions with a reason for an SVG lacking
-width/height/viewBox — same shape as a missing ffprobe duration. Rejected
-soft failure: the handler matched and the content is stored, one field is
-absent from the source, not lost by the crawler. No condition identified
-that would change this.
+Chose null `duration_seconds` with a `duration_unavailable_reason` when
+`ffprobe` is missing from `PATH` or finds nothing to read. Rejected soft
+failure: the handler matched and the video is stored, one field is absent
+from the source, not lost by the crawler. No condition identified that
+would change this.
 
 ## Blob naming: sha256 prefix + slug, one tree
 
