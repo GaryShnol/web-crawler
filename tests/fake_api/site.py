@@ -15,6 +15,7 @@ OFFHOST_IMAGE = "http://cdn.local/logo.png"
 LYING_CONTENT_TYPE = "http://fixture.local/lying-type"
 LYING_CONTENT_LENGTH = "http://fixture.local/lying-length"
 MISSING_CONTENT_TYPE = "http://fixture.local/no-content-type.png"
+REDIRECT = "http://fixture.local/redirected"
 
 STATUS_404 = "http://fixture.local/missing"
 STATUS_403 = "http://fixture.local/forbidden"
@@ -49,7 +50,8 @@ def build_routes() -> dict[str, list[FakeResponse]]:
         f'<a href="{PDF}">pdf</a>'
         f'<a href="{VIDEO}">video</a>'
         f'<a href="{DRIFTING}">drifting</a>'
-        f'<a href="{MISSING_CONTENT_TYPE}">no content type</a></body></html>'
+        f'<a href="{MISSING_CONTENT_TYPE}">no content type</a>'
+        f'<a href="{REDIRECT}">redirected</a></body></html>'
     )
     return {
         SEED: [_html(seed_html)],
@@ -82,6 +84,10 @@ def build_routes() -> dict[str, list[FakeResponse]]:
         # routing: contents.content_type must never end up storing this
         # None, since that column is NOT NULL (handlers/base.py's registry).
         MISSING_CONTENT_TYPE: [FakeResponse(200, {}, tiny_png())],
+        # Off the documented statusCode set entirely (see CLAUDE.md) --
+        # permanent by construction, not retried: see errors.py's classify()
+        # and DESIGN.md for why a 3xx isn't treated like an ordinary flake.
+        REDIRECT: [FakeResponse(302, {"Location": "http://fixture.local/redirect-target"}, None)],
         PDF: [FakeResponse(200, {"Content-Type": "application/pdf"}, tiny_pdf())],
         VIDEO: [FakeResponse(200, {"Content-Type": "video/mp4"}, tiny_video_no_duration())],
         DRIFTING: [

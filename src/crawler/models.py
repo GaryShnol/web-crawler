@@ -99,7 +99,6 @@ class FetchResult:
 
     outcome: Outcome
     elapsed: float
-    resolved_url: str | None
     response: FetchResponse | None
     error_kind: "ErrorKind | None" = None
     error_detail: str | None = None

@@ -56,32 +56,56 @@ Docker on Windows, where this runs — a mechanism that fails on the required
 platform is a latent bug, not a fallback. Would reconsider given a
 deployment target guaranteed to run on one hardlink-capable filesystem.
 
-## Redirects: resolved_url, not a follow loop
+## Redirects: permanent on arrival, not a follow loop
 
-Chose reading `Location` off a `200` straight into `FetchResult.resolved_url`.
-Rejected a follow loop with `max_redirects` and cycle detection. The fetch
-API's status set is closed at `200|404|429|403|500` — no 3xx exists in it —
-so the only shape a redirect can take is a `200` the API already followed on
-our behalf, telling us where it landed. There's nothing left for this client
-to chase, so `max_redirects` came out of config; nothing read it. Would
-reconsider if the API ever returned a 3xx directly.
+The assignment's statusCode table has no 3xx row, and `CLAUDE.md`'s own
+mirror of the fetch API's type is a closed `200|404|429|403|500`. Read that
+the same way an earlier pass here read `ETag` against a status set with no
+`304` in it: a header can be worth capturing cheaply without the table
+promising the status code that would normally pair with it. That earlier
+pass over-read it, though — it took the closed set as proof a redirect could
+only ever surface as a `200` the API had already followed for us, and built
+`FetchResult.resolved_url` to catch `Location` off *any* response on that
+premise. Nothing ever demonstrated a real API 3xx to justify that jump, and
+in the meantime nothing in `src/` ever read the field — same one-write-site
+shape as `encode_body`/`decode_body` below. Removed.
+
+What replaced it is narrower: `errors.py`'s `classify()` treats any `3xx` as
+its own case, `PERMANENT_FAILURE` with `ErrorKind.REDIRECT`, `Location`
+folded straight into `Classification.detail` — the one place that detail is
+ever read again (`urls.error_message`). Still no follow loop, still no
+`max_redirects` — chasing a target this API's own contract says shouldn't
+exist would be building for a situation nothing has shown is real. What
+changed is treating "off-contract" as license to disbelieve the response
+rather than license to skip classifying it. A `429`/`500`/unrecognized
+status still gets `TEMPORARY_FAILURE`: this API is documented as flaky, so a
+status genuinely never seen before is defensibly one more flake, and a
+wasted retry costs less than losing a url on a guess. A `3xx` is different in
+kind — it's a deterministic answer about *this* url, not noise, so retrying
+it meets the identical redirect every time. That asymmetry, not the closed
+status set on its own, is why `3xx` gets `PERMANENT` while every other
+surprise stays `TEMPORARY`. Would reconsider if the real API ever demonstrably
+sent one.
 
 ## Assumption: body crosses the wire as base64
 
 The fetch API's own spec is `body: Buffer | null` — that's the real API's
 contract, not something I can call and inspect. I don't know how it actually
 serializes a `Buffer` into the JSON envelope, so `fetch/client.py` assumes
-base64 text, or `null`. `tests/fake_api` encodes the same way *by calling the
-same function* (`crawler.models.encode_body`, decoded back with
-`decode_body`) rather than each side independently deciding "base64 sounds
-right" — the fixture and the client verifying each other would just be two
-guesses agreeing with themselves.
+base64 text, or `null`; `tests/fake_api/app.py`'s own envelope-building
+guesses the same way, independently. A shared `encode_body`/`decode_body`
+pair used to sit in `models.py` specifically so the two sides couldn't
+quietly diverge on the guess — but with exactly one production call site and
+one test-double call site, it was CLAUDE.md's own "no abstraction with a
+single implementation" rule applied to my own code, so it's gone, inlined at
+both. The trade is real and accepted: nothing now enforces the two stay in
+sync, just two two-line `base64.b64*` calls that happen to agree.
 
 If the real API turns out to send something else — a plain string, an array
-of ints, hex — the one line that changes is `decode_body` in
-`src/crawler/models.py`. Everything downstream (`classify`, `FetchResponse`,
-the handlers) already only knows `bytes | None`; none of it knows or cares
-how those bytes were spelled on the wire.
+of ints, hex — both call sites change: `fetch/client.py`'s decode and
+`tests/fake_api/app.py`'s encode. Everything downstream (`classify`,
+`FetchResponse`, the handlers) already only knows `bytes | None`; none of it
+knows or cares how those bytes were spelled on the wire.
 
 ## Lease recovery: a separate sweep, not folded into claim_batch
 

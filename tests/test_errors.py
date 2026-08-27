@@ -28,6 +28,29 @@ class TestPermanentFailures:
         assert result == Classification(Outcome.PERMANENT_FAILURE, ErrorKind.FORBIDDEN)
 
 
+class TestRedirect:
+    # A 3xx is off the documented statusCode set the same way a 418 is (see
+    # TestTemporaryFailures.test_unexpected_status_is_temporary...), but it's
+    # PERMANENT rather than TEMPORARY: it's a deterministic answer about this
+    # url, not this API's ordinary flakiness, so a retry meets the same
+    # redirect every time (see DESIGN.md).
+    def test_302_with_location_is_permanent_redirect(self):
+        result = classify(_response(302, {"Location": "http://fixture.local/final"}))
+        assert result.outcome is Outcome.PERMANENT_FAILURE
+        assert result.error_kind is ErrorKind.REDIRECT
+        assert result.detail == "redirect to http://fixture.local/final"
+
+    def test_location_lookup_is_case_insensitive(self):
+        result = classify(_response(301, {"location": "http://fixture.local/final"}))
+        assert result.detail == "redirect to http://fixture.local/final"
+
+    def test_redirect_with_no_location_is_still_permanent_redirect(self):
+        result = classify(_response(307))
+        assert result.outcome is Outcome.PERMANENT_FAILURE
+        assert result.error_kind is ErrorKind.REDIRECT
+        assert result.detail == "redirect with no Location header"
+
+
 class TestTemporaryFailures:
     def test_429_is_temporary_rate_limited(self):
         result = classify(_response(429, {"Retry-After": "2"}))

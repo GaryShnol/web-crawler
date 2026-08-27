@@ -15,7 +15,7 @@ import aiohttp
 
 from ..config import Config
 from ..errors import classify, classify_exception, classify_oversized_body
-from ..models import FetchResponse, FetchResult, find_header
+from ..models import FetchResponse, FetchResult
 
 _BASE64_GROUP = 4  # base64 emits 4 output bytes per 3 input bytes
 _ENVELOPE_OVERHEAD_BYTES = 8192  # room for statusCode, headers, and JSON punctuation
@@ -95,7 +95,6 @@ class FetchClient:
             return FetchResult(
                 outcome=classification.outcome,
                 elapsed=time.monotonic() - started,
-                resolved_url=None,
                 response=None,
                 error_kind=classification.error_kind,
                 error_detail=classification.detail,
@@ -105,7 +104,6 @@ class FetchClient:
             return FetchResult(
                 outcome=classification.outcome,
                 elapsed=time.monotonic() - started,
-                resolved_url=None,
                 response=None,
                 error_kind=classification.error_kind,
                 error_detail=classification.detail,
@@ -128,7 +126,6 @@ class FetchClient:
         return FetchResult(
             outcome=classification.outcome,
             elapsed=elapsed,
-            resolved_url=find_header(response.headers, "Location"),
             response=response,
             error_kind=classification.error_kind,
             error_detail=classification.detail,

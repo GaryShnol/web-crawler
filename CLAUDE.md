@@ -103,22 +103,13 @@ and its findings are being worked through.
   indistinguishable from a hang to anyone watching it. Neither of the two
   suspects previously recorded here, pool exhaustion and rate-limiter
   starvation, was involved in either.
-- **Open review finding.** `Location` is captured onto
-  `FetchResult.resolved_url` and never read, so a redirect is classified as
-  a transient failure and burns its whole retry budget against the same
-  3xx. Design questions raised, not yet answered: whether the fix should be
-  scoped to 3xx specifically (new `ErrorKind.REDIRECT`, `PERMANENT_FAILURE`,
-  `Location` folded into `error_message`) versus the broader "any
-  off-contract status defaults to `TEMPORARY_FAILURE`" pattern, and whether
-  `FetchResult.resolved_url` survives that fix or is removed as the same
-  one-write-site dead field `encode_body`/`decode_body` turned out to be.
 - **`tests/fake_api/` only generates responses the code handles well.**
-  Nothing reachable from the seed page returns 404, 403, 429, 500, a
-  redirect, or a malformed envelope, so no crawl has ever traversed a
-  failure end to end. Every missing fixture sits on the far side of an
-  `except` clause or a status branch nothing has driven. (A missing
-  `Content-Type` is covered now — `site.py`'s `MISSING_CONTENT_TYPE`,
-  driven end to end by `test_engine.py`'s
+  Nothing reachable from the seed page returns 404, 403, 429, 500, or a
+  malformed envelope, so no crawl has ever traversed those failures end to
+  end. Every missing fixture sits on the far side of an `except` clause or a
+  status branch nothing has driven. (A missing `Content-Type` and a 3xx
+  redirect are covered now — `site.py`'s `MISSING_CONTENT_TYPE` and
+  `REDIRECT`, both driven end to end by `test_engine.py`'s
   `test_full_fixture_graph_crawls_clean`, which is also the first test to
   run `engine.run()` over `site.build_routes()`'s whole graph at all rather
   than an ad-hoc single-URL route dict.)
@@ -131,23 +122,28 @@ and its findings are being worked through.
   one more `@register`'d file, same shape as this one, whenever something
   actually needs it. The fixture site only ever serves PNG.
 
-Next, in order: the three open review findings, then the fake_api gaps
-above, then a `README.md`, then the worklog and delivery.
+All three adversarial-review findings are closed. Next, in order: the
+fake_api gaps above (404/403/429/500, malformed envelope), then a
+`README.md`, then the worklog and delivery.
 
 ### Merged and working
 
 ```
 models.py    Outcome, FetchResponse(status_code, headers, body),
-             FetchResult(outcome, elapsed, resolved_url, response,
+             FetchResult(outcome, elapsed, response,
                          error_kind=None, error_detail=None),
              find_header, parse_retry_after
-errors.py    ErrorKind (incl. internal_error), Classification(outcome,
+errors.py    ErrorKind (incl. internal_error, redirect), Classification(outcome,
              error_kind, detail=None), classify(response, prev_etag=None),
              classify_oversized_body(max_body_bytes, bytes_read),
              classify_unparseable_content(exc), classify_internal_error(exc),
              classify_exception(exc)
              detail is set only where a classifier holds real numbers or a
-             caught exception; nothing downstream rebuilds it
+             caught exception; nothing downstream rebuilds it. classify()
+             treats any 3xx as PERMANENT_FAILURE/REDIRECT, Location folded
+             into detail — see DESIGN.md's redirect decision for why 3xx
+             doesn't get the same benefit-of-the-doubt as other off-contract
+             statuses (still TEMPORARY_FAILURE/UNEXPECTED_STATUS)
 url_tools.py normalize(url, base=None), in_scope(url, seed_host, allow_subdomains)
 config.py    Config (pydantic-settings) — seed_url is optional; only
              engine.run() requires it, so `stats` needs no placeholder

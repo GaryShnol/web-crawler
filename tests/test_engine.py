@@ -390,6 +390,15 @@ class TestRunEndToEnd:
         )
         assert stored_type == "image/png"  # ImageHandler's own canonical type, from sniff alone
 
+        redirect_row = await pool.fetchrow(
+            "SELECT status, attempts, error_kind, error_message FROM urls WHERE normalized_url = $1",
+            site.REDIRECT,
+        )
+        assert redirect_row["status"] == "failed"
+        assert redirect_row["attempts"] == 1  # PERMANENT: gives up without touching max_attempts
+        assert redirect_row["error_kind"] == "redirect"
+        assert "http://fixture.local/redirect-target" in redirect_row["error_message"]
+
     async def test_a_missing_seed_url_is_rejected_before_touching_the_pool(self):
         config = Config(database_url=TEST_DATABASE_URL, fetch_api_url="http://unused/unused")
         with pytest.raises(ValueError, match="seed_url"):

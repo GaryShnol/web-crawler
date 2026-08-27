@@ -45,7 +45,6 @@ class TestSuccessAndClassification:
         assert result.outcome == Outcome.SUCCESS
         assert result.response.status_code == 200
         assert result.response.body == b"<html></html>"
-        assert result.resolved_url is None
 
     async def test_url_with_query_string_round_trips_as_the_route_key(self):
         url = "http://fixture.local/page?a=1&b=2"
@@ -89,15 +88,16 @@ class TestSuccessAndClassification:
 
         assert result.outcome == Outcome.NOT_MODIFIED
 
-    async def test_resolved_url_recorded_when_location_present(self):
-        routes = {"u": [FakeResponse(200, {"Location": "http://fixture.local/final"}, b"data")]}
+    async def test_permanent_failure_for_redirect(self):
+        routes = {"u": [FakeResponse(302, {"Location": "http://fixture.local/final"}, None)]}
         async with (
             _running(create_app(routes)) as server,
             FetchClient(_config(str(server.make_url("/fetch")))) as client,
         ):
             result = await client.fetch("u")
 
-        assert result.resolved_url == "http://fixture.local/final"
+        assert result.outcome == Outcome.PERMANENT_FAILURE
+        assert "http://fixture.local/final" in result.error_detail
 
     async def test_multiple_fetches_on_one_client_each_get_their_own_response(self):
         # Proves the client can be called repeatedly and routes/sequences

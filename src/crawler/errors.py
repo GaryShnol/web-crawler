@@ -22,6 +22,7 @@ class ErrorKind(enum.Enum):
     FORBIDDEN = "forbidden"
     RATE_LIMITED = "rate_limited"
     SERVER_ERROR = "server_error"
+    REDIRECT = "redirect"
     EMPTY_BODY = "empty_body"
     TRUNCATED_BODY = "truncated_body"
     BODY_TOO_LARGE = "body_too_large"
@@ -61,6 +62,17 @@ def classify(response: FetchResponse, prev_etag: str | None = None) -> Classific
     if status in _TEMPORARY_STATUSES:
         kind = ErrorKind.RATE_LIMITED if status == 429 else ErrorKind.SERVER_ERROR
         return Classification(Outcome.TEMPORARY_FAILURE, kind)
+
+    if 300 <= status < 400:
+        # Off the documented statusCode set (see CLAUDE.md), unlike the
+        # fallback below: a 3xx is a deterministic answer about this url, not
+        # this API's ordinary flakiness, so retrying it meets the same
+        # redirect every time — PERMANENT on purpose (see DESIGN.md).
+        # Location is folded into detail here, not carried on FetchResult,
+        # since nothing else ever needs it once a failure is recorded.
+        location = find_header(response.headers, "Location")
+        detail = f"redirect to {location}" if location else "redirect with no Location header"
+        return Classification(Outcome.PERMANENT_FAILURE, ErrorKind.REDIRECT, detail)
 
     if status != 200:
         return Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.UNEXPECTED_STATUS)
