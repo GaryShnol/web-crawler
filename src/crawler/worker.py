@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 import asyncpg
 
 from .config import Config
-from .errors import ErrorKind, classify_unparseable_content
+from .errors import ErrorKind, classify_internal_error, classify_unparseable_content
 from .fetch.client import FetchClient
 from .fetch.rate_limiter import RateLimiter
 from .fetch.retry import GiveUp, next_attempt
@@ -79,7 +79,7 @@ async def _persist_success(
 
     try:
         handled = handler.handle(response.body, claimed.url)
-    except Exception:
+    except Exception as exc:
         # A body that passed handler.sniff() can still be truncated,
         # corrupt, or (a PDF) encrypted -- real conditions this crawler is
         # meant to survive, not a bug in this codebase. Nothing's been
@@ -87,7 +87,7 @@ async def _persist_success(
         # blob or contents row -- just a failure/retry outcome, same shape
         # as a fetch-level one.
         logger.exception("handler failed to parse a sniff-matched body", extra={"context": {"kind": handler.kind}})
-        classification = classify_unparseable_content()
+        classification = classify_unparseable_content(exc)
         decision = next_attempt(
             classification.outcome,
             claimed.attempt_no,
@@ -97,7 +97,9 @@ async def _persist_success(
             jitter=random.random(),
         )
         async with pool.acquire() as conn, conn.transaction():
-            await frontier.mark_failed(conn, claimed.id, claimed.lease_token, decision, classification.error_kind)
+            await frontier.mark_failed(
+                conn, claimed.id, claimed.lease_token, decision, classification.error_kind, classification.detail
+            )
         outcome = "failed" if isinstance(decision, GiveUp) else "retrying"
         return {"outcome": outcome, "error_kind": classification.error_kind.value}
 
@@ -114,7 +116,7 @@ async def _persist_success(
 
     async with pool.acquire() as conn, conn.transaction():
         await metadata.insert_content(
-            conn, content_hash, content_type, len(response.body), storage_path
+            conn, content_hash, handler.content_type, len(response.body), storage_path
         )
         if handled.metadata is not None:
             await metadata.insert_metadata(conn, content_hash, handler.kind, handled.metadata)
@@ -149,9 +151,29 @@ async def _persist_failure(
         result.outcome, claimed.attempt_no, headers, datetime.now(UTC), config, jitter=random.random()
     )
     async with pool.acquire() as conn, conn.transaction():
-        await frontier.mark_failed(conn, claimed.id, claimed.lease_token, decision, result.error_kind)
+        await frontier.mark_failed(
+            conn, claimed.id, claimed.lease_token, decision, result.error_kind, result.error_detail
+        )
     outcome = "failed" if isinstance(decision, GiveUp) else "retrying"
     return {"outcome": outcome, "error_kind": result.error_kind.value}
+
+
+async def _persist_internal_error(
+    pool: asyncpg.Pool, claimed: frontier.ClaimedUrl, config: Config, exc: Exception
+) -> dict[str, object]:
+    """No response to read Retry-After from, so this never touches the rate
+    limiter (see DESIGN.md) — only the remote service's own signals should.
+    """
+    classification = classify_internal_error(exc)
+    decision = next_attempt(
+        classification.outcome, claimed.attempt_no, {}, datetime.now(UTC), config, jitter=random.random()
+    )
+    async with pool.acquire() as conn, conn.transaction():
+        await frontier.mark_failed(
+            conn, claimed.id, claimed.lease_token, decision, classification.error_kind, classification.detail
+        )
+    outcome = "failed" if isinstance(decision, GiveUp) else "retrying"
+    return {"outcome": outcome, "error_kind": classification.error_kind.value}
 
 
 async def process_one(
@@ -166,31 +188,36 @@ async def process_one(
     """Runs one claimed url end to end and logs exactly one structured
     completion line for it, carrying `outcome` alongside the url/attempt
     bound below and the worker_id bound by run() — never one line per
-    step. Never raises for a fetch or classification outcome — those all
-    land as a terminal write and that one line; only a real bug (a
-    database error, cancellation) propagates.
+    step. An uncaught bug is contained here too (see DESIGN.md): logged via
+    logger.exception, then recorded as its own retryable internal_error.
+    Only CancelledError, and a second failure while persisting the first,
+    still propagate.
     """
     with bind(url=claimed.url, attempt=claimed.attempt_no):
-        result = await _fetch(claimed, fetch_client, rate_limiter)
+        try:
+            result = await _fetch(claimed, fetch_client, rate_limiter)
 
-        async with pool.acquire() as conn:
-            await frontier.record_attempt(
-                conn,
-                claimed.id,
-                claimed.attempt_no,
-                status_code=result.response.status_code if result.response else None,
-                elapsed=result.elapsed,
-                error_kind=result.error_kind,
-            )
+            async with pool.acquire() as conn:
+                await frontier.record_attempt(
+                    conn,
+                    claimed.id,
+                    claimed.attempt_no,
+                    status_code=result.response.status_code if result.response else None,
+                    elapsed=result.elapsed,
+                    error_kind=result.error_kind,
+                )
 
-        if result.outcome is Outcome.SUCCESS:
-            context = await _persist_success(pool, claimed, result, config, seed_host)
-        elif result.outcome is Outcome.NOT_MODIFIED:
-            async with pool.acquire() as conn, conn.transaction():
-                await frontier.mark_unchanged(conn, claimed.id, claimed.lease_token)
-            context = {"outcome": "unchanged"}
-        else:
-            context = await _persist_failure(pool, claimed, result, config)
+            if result.outcome is Outcome.SUCCESS:
+                context = await _persist_success(pool, claimed, result, config, seed_host)
+            elif result.outcome is Outcome.NOT_MODIFIED:
+                async with pool.acquire() as conn, conn.transaction():
+                    await frontier.mark_unchanged(conn, claimed.id, claimed.lease_token)
+                context = {"outcome": "unchanged"}
+            else:
+                context = await _persist_failure(pool, claimed, result, config)
+        except Exception as exc:
+            logger.exception("unhandled exception processing claimed url")
+            context = await _persist_internal_error(pool, claimed, config, exc)
 
         logger.info("url completed", extra={"context": context})
 

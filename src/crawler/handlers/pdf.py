@@ -11,11 +11,12 @@ from .base import Handler, HandlerResult, register
 _PDF_MAGIC = b"%PDF-"
 
 
-@register("application/pdf")
+@register
 class PdfHandler(Handler):
     kind = "pdf"
     directory = "pdfs"
     extension = "pdf"
+    content_type = "application/pdf"
 
     def sniff(self, body: bytes) -> bool:
         return body.startswith(_PDF_MAGIC)

@@ -1,4 +1,4 @@
-.PHONY: up down test crawl stats reset
+.PHONY: up down test crawl stats reset psql
 
 # Builds and starts db + fake-api, waits for both healthchecks, then runs
 # the crawl. Exits with the crawler's own exit code once it finishes --
@@ -21,6 +21,12 @@ crawl:
 
 stats:
 	docker compose run --build --rm crawler stats
+
+# Opens psql inside the db container. The same database is also published
+# on localhost:55433 (postgres / crawler) for an external client -- see the
+# ports mapping in docker-compose.yml.
+psql:
+	docker compose exec db psql -U postgres -d crawler
 
 # Down, plus the volumes -- a clean slate, not just a stop. Safe to run
 # against nothing already up: compose down is a no-op then, not an error.

@@ -84,53 +84,87 @@ A module gets created when it has work to do, not before.
 
 ## Where things stand
 
-Features 1–4 are merged into `main`. `feature/5-hardening` is committed but
+Features 1-4 are merged into `main`. `feature/5-hardening` is committed but
 not merged: change detection (5.2), observability (5.3), docker-compose and
-the Makefile (5.4). 5.1 — the SIGKILL resumability test — was never written.
+the Makefile (5.4). 5.1 — the SIGKILL resumability test — is written now,
+on `feature/6-delivery`: `tests/test_resumability.py`, the one test in the
+suite that runs the crawler as a real OS subprocess rather than in-process
+asyncio, because SIGKILL only means anything against a real process.
+`feature/6-delivery` is the current branch: the adversarial review has run
+and its findings are being worked through.
 
 ### What is actually missing
 
-Feature 4 is finished as of this session: all four handlers exist and
-`handlers/html.py` extracts what CLAUDE.md's "What I'm building" promises. The
-two-run change-detection demo has been run once, manually, outside Docker
-(below) — it hasn't been run through `docker compose up` because that still
-hangs (next bullet), and it isn't wired into any test yet.
-
-- **`docker compose up` still cannot finish a crawl.** Untouched this
-  session — the demo below runs the crawler as a local `uv run` process
-  against the same test Postgres container (`crawler-test-pg`,
-  `localhost:55432`) and a locally-started `fake_api`, specifically to route
-  around this bug rather than depend on it being fixed. It hangs on the
-  first fetch, reproducibly, even at `MAX_CONCURRENCY=1`, and does not
-  reproduce outside Docker. Network from inside the stuck container is fine
-  and Postgres has nothing blocked, so the two live suspects are (a)
-  connection-pool exhaustion — 5.3 added `_progress` as a third
-  `pool.acquire()` consumer beside `_supervise` and every worker, so check
-  what `create_pool` derives `max_size` from — and (b) the rate limiter
-  starving, since `acquire()` runs before any network call and an ungranted
-  token is indistinguishable from a fetch that never returns.
-- **There is no `README.md`.** The two-run table below is meant to land in
-  it, not stand alone.
+- **`docker compose up` now finishes a crawl.** It failed for two unrelated
+  reasons, and both were found by running the delivery path itself rather
+  than the test suite, which stayed green throughout. First,
+  `docker-entrypoint.sh` was checked out with CRLF, so Linux looked for an
+  interpreter named `/bin/sh\r` and the container exited 255 before any
+  Python ran; `.gitattributes` pins `*.sh` to LF now. Second, drain
+  detection rode `lease_recovery_interval_seconds`, so a crawl that finished
+  nine urls in two seconds still took another sixty to exit — correct, but
+  indistinguishable from a hang to anyone watching it. Neither of the two
+  suspects previously recorded here, pool exhaustion and rate-limiter
+  starvation, was involved in either.
 - **`handlers/html.py` still doesn't honour `<base href>`.** Resolution
-  always uses the page's own url — unchanged from before this session, and
-  not part of what was asked for this step.
+  always uses the page's own url.
 - **`handlers/image.py` only registers PNG.** Sniffed by real PNG magic
-  bytes, not by asking Pillow to open anything — a second raster format
-  (JPEG, GIF, WebP) is one more `@register`'d file, same shape as this one,
-  whenever something actually needs it. The fixture site only ever serves
-  PNG.
+  bytes, not by asking Pillow to open anything — a second raster format is
+  one more `@register`'d file, same shape as this one, whenever something
+  actually needs it. The fixture site only ever serves PNG.
 
-Next, in order: the hang, then a `README.md` (the table below is the seed for
-its change-detection section), then review and delivery.
+All three adversarial-review findings are closed, and `tests/fake_api/` no
+longer only generates responses the code handles well: every fixture below
+is reachable from the seed page and driven end to end by `test_engine.py`'s
+`test_full_fixture_graph_crawls_clean_then_a_restart_touches_nothing` — the
+first test to run `engine.run()` over `site.build_routes()`'s whole graph at
+all, rather than an ad-hoc single-URL route dict; also the only test proving
+a second run against an already-fully-drained database does nothing (exit 0
+alone doesn't say that — every url's `attempts`/`content_hash`/
+`last_seen_at` staying byte-identical is the actual claim, `last_seen_at`
+the sharpest of the three since it only moves inside a real claim).
+`MISSING_CONTENT_TYPE` (no `Content-Type` header),
+`REDIRECT` (a 3xx with `Location`), `STATUS_404`/`STATUS_403` (permanent,
+one attempt), `STATUS_500`/`STATUS_429_WITH_RETRY_AFTER` (transient, driven
+to `max_attempts`), `MALFORMED_ENVELOPE` (not valid JSON — see
+`errors.py`'s `classify_malformed_response`), and `STATUS_429_THEN_SUCCESS`
+(the one route that recovers, proving the retry policy and the limiter
+actually let a transient failure succeed and not just fail predictably).
+`STATUS_429_WITHOUT_RETRY_AFTER` stays unlinked — that distinction is
+already covered by the rate limiter's own unit tests.
+
+`README.md` is written — key decisions, trade-offs, production-scale notes,
+and what I'd do differently, including the lease-renewal gap and the
+two-run change-detection table (recaptured under a real `docker compose up`
+this time; the version this file used to point to was a local `uv run`
+that routed around the compose hang, back when compose was broken, and
+those numbers never belonged in a delivered README). `DESIGN.md` is
+trimmed to what a reviewer needs to disagree with each decision, not the
+full argument. Next: the worklog and delivery.
 
 ### Merged and working
 
 ```
 models.py    Outcome, FetchResponse(status_code, headers, body),
-             FetchResult(outcome, elapsed, resolved_url, response),
-             find_header, parse_retry_after, encode_body/decode_body
-errors.py    ErrorKind, Classification, classify(response, prev_etag=None),
-             classify_oversized_body(), classify_exception(...)
+             FetchResult(outcome, elapsed, response,
+                         error_kind=None, error_detail=None),
+             find_header, parse_retry_after
+errors.py    ErrorKind (incl. internal_error, redirect, malformed_response),
+             Classification(outcome, error_kind, detail=None),
+             classify(response, prev_etag=None),
+             classify_oversized_body(max_body_bytes, bytes_read),
+             classify_unparseable_content(exc), classify_internal_error(exc),
+             classify_malformed_response(exc), classify_exception(exc)
+             detail is set only where a classifier holds real numbers or a
+             caught exception; nothing downstream rebuilds it. classify()
+             treats any 3xx as PERMANENT_FAILURE/REDIRECT, Location folded
+             into detail — see DESIGN.md's redirect decision for why 3xx
+             doesn't get the same benefit-of-the-doubt as other off-contract
+             statuses (still TEMPORARY_FAILURE/UNEXPECTED_STATUS).
+             classify_malformed_response is fetch/client.py's own — invalid
+             JSON, a missing statusCode, or bad base64, all TEMPORARY and
+             deliberately not INTERNAL_ERROR: that kind means a bug in this
+             codebase, and a malformed envelope is the remote side instead
 url_tools.py normalize(url, base=None), in_scope(url, seed_host, allow_subdomains)
 config.py    Config (pydantic-settings) — seed_url is optional; only
              engine.run() requires it, so `stats` needs no placeholder
@@ -181,8 +215,10 @@ store/blobs.py
              write(output_dir, directory, extension, url, body)
                  -> (content_hash, storage_path)
 store/metadata.py
-             insert_content(conn, content_hash, content_type, byte_size,
+             insert_content(conn, content_hash, content_type: str, byte_size,
                             storage_path)
+                 content_type is always the matched handler's own
+                 canonical type, never the raw response header
              insert_metadata(conn, content_hash, kind, payload)
 store/stats.py   read-only, nothing in the live crawl calls it
              Stats(status_counts, failure_reasons, attempts_total,
@@ -192,9 +228,15 @@ store/stats.py   read-only, nothing in the live crawl calls it
 
 handlers/base.py
              HandlerResult(metadata: dict | None, links: list[DiscoveredLink])
-             Handler protocol: kind, directory, extension, sniff(body),
-                               handle(body, url) -> HandlerResult
-             register(content_type), resolve(content_type, body) -> Handler | None
+             Handler protocol: kind, directory, extension, content_type,
+                               sniff(body), handle(body, url) -> HandlerResult
+                 content_type is the one canonical string for the family
+                 (e.g. "text/html") — declared once on the class, next to
+                 kind/directory/extension, and what a matched body's
+                 contents row stores. Never the raw response header.
+             register(cls) -> cls  -- @register, no argument; keys _REGISTRY
+                               off cls.content_type
+             resolve(content_type, body) -> Handler | None
 handlers/html.py   HtmlHandler "text/html" — kind "page", dir "pages", ext "html"
                    links: a[href] (is_asset=False) plus img/video/source/embed
                    src (is_asset=True); metadata {title, link_count} over all
@@ -215,11 +257,28 @@ handlers/video.py  VideoHandler "video/mp4" — kind "video", dir "videos", ext 
 
 worker.py    process_one(...) — one structured "url completed" log line per
              url, carrying outcome (done/skipped/unchanged/retrying/failed)
-             plus kind/links/hash_changed or error_kind
+             plus kind/links/hash_changed or error_kind. An uncaught bug is
+             contained here: logged, then written as a retryable
+             internal_error, rather than killing the worker silently
 engine.py    run(config, sleep=asyncio.sleep) -> int — bounded pool, lease
-             supervisor, progress task, graceful shutdown
+             supervisor, drain watcher, progress task, graceful shutdown.
+             Returns 1 if a worker or a support task died with a real
+             exception; a url that gave up after max_attempts does not
+             change it. Logs one "crawl stopped" line with the reason
+             (drain / signal / a dead support task) and terminal counts
 cli.py       `crawl <seed>` and `stats [--since <iso8601>]` (text report)
-tests/       fake_api/ test double + test_* for everything above
+tests/       fake_api/ test double + test_* for everything above.
+             test_resumability.py is the exception: spawns the crawler via
+             `sys.executable -m crawler.cli crawl <seed>` (PYTHONPATH set by
+             hand -- crawler isn't installed, pytest's own `pythonpath` ini
+             option is the only reason imports work everywhere else),
+             SIGKILLs it mid-crawl (proc.kill(), verified empirically to run
+             no Python in the child on this platform -- no skipif needed),
+             restarts against the same DB, and asserts nothing lost, nothing
+             done re-fetched, and whatever was genuinely still in flight
+             costs exactly one extra claim. Never blocks on Popen.wait() --
+             that freezes this process's own event loop, which is what's
+             serving the fake API the subprocess talks to.
 ```
 
 `attempts` is incremented only by `claim_batch`'s own statement — not by
@@ -231,6 +290,7 @@ tests/       fake_api/ test double + test_* for everything above
 Config keys: `seed_url` (optional), `database_url`, `fetch_api_url`,
 `max_concurrency`, `max_depth`, `requests_per_second`, `max_attempts`,
 `lease_seconds`, `max_body_bytes`, `connect_timeout_seconds`,
+`drain_check_interval_seconds`,
 `read_timeout_seconds`, `allow_subdomains`, `lease_recovery_interval_seconds`,
 `poll_interval_seconds`, `shutdown_grace_seconds`, `progress_interval_seconds`,
 `rate_limit_min_rps`, `rate_limit_decrease_factor`,
@@ -262,9 +322,12 @@ and readable enough that opening the folder tells you something. I skipped
 hardlinking a content-addressed store into a browsable one because that breaks
 across filesystems and behaves badly in Docker on Windows, which is where this
 has to run. Identical bytes from two URLs are stored once, so the folder alone
-can't tell you the site structure — `urls.content_hash` in the database does,
-and each type directory also gets an `index.jsonl` mapping file to hash to the
-URLs that produced it.
+can't tell you the site structure — `urls.content_hash` in the database is
+what maps a stored file back to the URLs that produced it. A per-type
+`index.jsonl` restating that same mapping on disk was considered and dropped
+before it was ever built: it would be the exact two-writes-one-fact problem
+the no-broker decision above already rules out, just relocated to the
+filesystem.
 
 **Two spellings of the same URL stay two URLs.** I normalize the things nobody
 argues about — fragment, scheme and host casing, default ports, `../`,
@@ -316,13 +379,14 @@ image, video, and PDF, the URL is recorded as `skipped`: no error kind, no
 retry, no body written. `content_type` and `content_length` are kept on the
 row so what was seen is still visible without having downloaded it.
 
-**A field that's legitimately unknowable isn't a failure either.** An SVG can
-be well-formed with no `width`/`height` and no `viewBox` — no intrinsic size
-to read, off the root or anywhere else. When that happens `width` and `height`
-are stored `null` with a reason, `file_size` is stored as usual, and nothing
-about the row says failure. Same shape as video duration when `ffprobe` isn't
-on the `PATH`: the content is real and stored, one field is genuinely absent,
-and that's a fact worth recording, not an error worth retrying.
+**A field that's legitimately unknowable isn't a failure either.** A video's
+duration is unreadable when `ffprobe` isn't on the `PATH`, or is but the
+container has nothing in it to read — no exception, just nothing to report.
+When that happens `duration_seconds` is stored `null` with a
+`duration_unavailable_reason`, `file_size` is stored as usual, and nothing
+about the row says failure: the content is real and stored, one field is
+genuinely absent, and that's a fact worth recording, not an error worth
+retrying.
 
 If you think one of these is wrong, give me the argument before you change
 course.
@@ -332,8 +396,8 @@ course.
 Frontier and visited state, each URL's status — success, failure, or skipped
 for an unmatched content type — attempt count and failure reason, its next
 retry time and current lease, content hash and ETag, the per-type metadata
-(including a reason when an expected field like SVG dimensions or video
-duration is legitimately absent), and the discovery graph of which page linked
+(including a reason when an expected field like video duration is
+legitimately absent), and the discovery graph of which page linked
 to which. Enough to stop the crawler, inspect it, and start it again without
 losing or repeating work.
 
@@ -375,7 +439,7 @@ committed alongside the code.
 
 ```bash
 uv run ruff check
-grep -rn "status_code ==" src/   # should only ever match errors.py
+grep -rln "\.status_code" src/   # errors.py and worker.py, nothing else
 grep -rn "TODO" src/             # should be empty
 uv run pytest                    # frontier concurrency test, 20 runs, no flakes
 ```

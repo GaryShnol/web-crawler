@@ -5,6 +5,7 @@ ask about. Retries, rate limiting, and the frontier are someone else's job;
 this is url in, `FetchResult` out.
 """
 
+import base64
 import json
 import math
 import time
@@ -13,19 +14,31 @@ from typing import Self
 import aiohttp
 
 from ..config import Config
-from ..errors import classify, classify_exception, classify_oversized_body
-from ..models import FetchResponse, FetchResult, decode_body, find_header
+from ..errors import (
+    classify,
+    classify_exception,
+    classify_malformed_response,
+    classify_oversized_body,
+)
+from ..models import FetchResponse, FetchResult
 
 _BASE64_GROUP = 4  # base64 emits 4 output bytes per 3 input bytes
 _ENVELOPE_OVERHEAD_BYTES = 8192  # room for statusCode, headers, and JSON punctuation
 
 
-async def _read_capped(http_response: aiohttp.ClientResponse, max_body_bytes: int) -> bytes | None:
+class _BodyTooLarge(Exception):
+    """Signals the cap trip out of _read_capped with the numbers classify_oversized_body needs."""
+
+    def __init__(self, bytes_read: int) -> None:
+        self.bytes_read = bytes_read
+
+
+async def _read_capped(http_response: aiohttp.ClientResponse, max_body_bytes: int) -> bytes:
     """Stream the raw response instead of buffering it whole — the point of
     the cap is to never hold more than roughly `max_body_bytes` in memory,
     and `await http_response.json()` reads the entire body first regardless
-    of what a (possibly lying) Content-Length claims. Returns None, with the
-    connection already closed, once the cap is exceeded.
+    of what a (possibly lying) Content-Length claims. Raises _BodyTooLarge,
+    with the connection already closed, once the cap is exceeded.
 
     The body arrives base64-encoded inside a JSON envelope, so the raw bytes
     run ~4/3 larger than the asset they encode; `_ENVELOPE_OVERHEAD_BYTES`
@@ -40,7 +53,7 @@ async def _read_capped(http_response: aiohttp.ClientResponse, max_body_bytes: in
         total += len(chunk)
         if total > cap:
             http_response.close()
-            return None
+            raise _BodyTooLarge(total)
         chunks.append(chunk)
     return b"".join(chunks)
 
@@ -82,40 +95,60 @@ class FetchClient:
                 self._config.fetch_api_url, params={"url": url}, headers=headers
             ) as http_response:
                 raw = await _read_capped(http_response, self._config.max_body_bytes)
+        except _BodyTooLarge as exc:
+            classification = classify_oversized_body(self._config.max_body_bytes, exc.bytes_read)
+            return FetchResult(
+                outcome=classification.outcome,
+                elapsed=time.monotonic() - started,
+                response=None,
+                error_kind=classification.error_kind,
+                error_detail=classification.detail,
+            )
         except (TimeoutError, aiohttp.ClientConnectionError, aiohttp.ClientPayloadError) as exc:
             classification = classify_exception(exc)
             return FetchResult(
                 outcome=classification.outcome,
                 elapsed=time.monotonic() - started,
-                resolved_url=None,
                 response=None,
                 error_kind=classification.error_kind,
+                error_detail=classification.detail,
             )
 
         elapsed = time.monotonic() - started
 
-        if raw is None:
-            classification = classify_oversized_body()
+        try:
+            envelope = json.loads(raw)
+            encoded_body = envelope.get("body")
+            # Assumed wire encoding for a `Buffer | null` body -- the real
+            # API's own encoding is unverifiable (see DESIGN.md), so this is
+            # a guess: base64, or null.
+            body = base64.b64decode(encoded_body) if encoded_body is not None else None
+            response = FetchResponse(
+                status_code=envelope["statusCode"], headers=envelope.get("headers") or {}, body=body
+            )
+        except (ValueError, KeyError, TypeError) as exc:
+            # ValueError covers invalid JSON (json.JSONDecodeError) and bad
+            # base64 padding (binascii.Error); KeyError is a missing
+            # statusCode; TypeError is a body that decoded but isn't a
+            # str/bytes base64 can work with. All three are the service
+            # returning garbage, not a bug here -- classified at this layer,
+            # before process_one's outer `except` (the real backstop for an
+            # actual bug) ever sees it. See classify_malformed_response.
+            classification = classify_malformed_response(exc)
             return FetchResult(
                 outcome=classification.outcome,
                 elapsed=elapsed,
-                resolved_url=None,
                 response=None,
                 error_kind=classification.error_kind,
+                error_detail=classification.detail,
             )
 
-        envelope = json.loads(raw)
-        body = decode_body(envelope.get("body"))
-
-        response = FetchResponse(
-            status_code=envelope["statusCode"], headers=envelope.get("headers") or {}, body=body
-        )
         classification = classify(response, prev_etag)
 
         return FetchResult(
             outcome=classification.outcome,
             elapsed=elapsed,
-            resolved_url=find_header(response.headers, "Location"),
             response=response,
             error_kind=classification.error_kind,
+            error_detail=classification.detail,
         )

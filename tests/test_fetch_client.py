@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
-from fake_api.app import FakeResponse, create_app
+from fake_api.app import FakeResponse, MalformedResponse, create_app
 
 from crawler.config import Config
 from crawler.fetch.client import FetchClient
@@ -45,7 +45,6 @@ class TestSuccessAndClassification:
         assert result.outcome == Outcome.SUCCESS
         assert result.response.status_code == 200
         assert result.response.body == b"<html></html>"
-        assert result.resolved_url is None
 
     async def test_url_with_query_string_round_trips_as_the_route_key(self):
         url = "http://fixture.local/page?a=1&b=2"
@@ -89,15 +88,16 @@ class TestSuccessAndClassification:
 
         assert result.outcome == Outcome.NOT_MODIFIED
 
-    async def test_resolved_url_recorded_when_location_present(self):
-        routes = {"u": [FakeResponse(200, {"Location": "http://fixture.local/final"}, b"data")]}
+    async def test_permanent_failure_for_redirect(self):
+        routes = {"u": [FakeResponse(302, {"Location": "http://fixture.local/final"}, None)]}
         async with (
             _running(create_app(routes)) as server,
             FetchClient(_config(str(server.make_url("/fetch")))) as client,
         ):
             result = await client.fetch("u")
 
-        assert result.resolved_url == "http://fixture.local/final"
+        assert result.outcome == Outcome.PERMANENT_FAILURE
+        assert "http://fixture.local/final" in result.error_detail
 
     async def test_multiple_fetches_on_one_client_each_get_their_own_response(self):
         # Proves the client can be called repeatedly and routes/sequences
@@ -112,6 +112,20 @@ class TestSuccessAndClassification:
 
         assert first.response.body == b"one"
         assert second.response.body == b"two"
+
+
+class TestMalformedEnvelope:
+    async def test_invalid_json_is_temporary_malformed_response(self):
+        routes = {"u": [MalformedResponse(b"{not json")]}
+        async with (
+            _running(create_app(routes)) as server,
+            FetchClient(_config(str(server.make_url("/fetch")))) as client,
+        ):
+            result = await client.fetch("u")
+
+        assert result.outcome == Outcome.TEMPORARY_FAILURE
+        assert result.response is None  # nothing parsed far enough to build one
+        assert result.error_detail is not None
 
 
 class TestConditionalRequest:
@@ -152,6 +166,7 @@ class TestBodyTooLarge:
         assert result.outcome == Outcome.PERMANENT_FAILURE
         # aborted mid-stream: no complete envelope to pull status/headers from
         assert result.response is None
+        assert "max_body_bytes=100" in result.error_detail
 
     async def test_body_within_the_cap_is_untouched(self):
         routes = {"u": [FakeResponse(200, {}, b"x" * 50)]}
@@ -176,6 +191,7 @@ class TestTransportFailures:
 
         assert result.outcome == Outcome.TEMPORARY_FAILURE
         assert result.response is None
+        assert result.error_detail is not None  # the refused-connection exception's own repr
 
 
 class TestUsageOutsideContextManager:

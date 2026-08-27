@@ -76,6 +76,14 @@ async def test_seed_page_links_all_resolve_in_the_route_table():
         site.PDF,
         site.VIDEO,
         site.DRIFTING,
+        site.MISSING_CONTENT_TYPE,
+        site.REDIRECT,
+        site.STATUS_404,
+        site.STATUS_403,
+        site.STATUS_500,
+        site.STATUS_429_WITH_RETRY_AFTER,
+        site.STATUS_429_THEN_SUCCESS,
+        site.MALFORMED_ENVELOPE,
     ]
     assert site.SEED in routes
     assert all(url in routes for url in linked)

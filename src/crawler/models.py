@@ -1,6 +1,5 @@
 """The fetch API's response shape, and what we track ourselves about a fetch attempt."""
 
-import base64
 import enum
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -18,21 +17,6 @@ class Outcome(enum.Enum):
     NOT_MODIFIED = "not_modified"
     PERMANENT_FAILURE = "permanent_failure"
     TEMPORARY_FAILURE = "temporary_failure"
-
-
-def encode_body(body: bytes | None) -> str | None:
-    """How a `Buffer | null` body is assumed to cross the wire as JSON — the
-    real API's own encoding is unverifiable (see DESIGN.md), so this is a
-    guess: base64, or `null`. fetch/client.py and tests/fake_api both call
-    this pair instead of `base64.b64*` directly, so they can't quietly
-    diverge on the guess.
-    """
-    return base64.b64encode(body).decode() if body is not None else None
-
-
-def decode_body(encoded: str | None) -> bytes | None:
-    """The inverse of `encode_body` — see its docstring."""
-    return base64.b64decode(encoded) if encoded is not None else None
 
 
 def find_header(headers: dict[str, str], name: str) -> str | None:
@@ -108,10 +92,13 @@ class FetchResult:
     and it's the one thing a caller recording a failure (store/frontier.py's
     mark_failed, which requires it) can't safely re-derive — a `response`-less
     result (timeout, oversized body) has nothing left to reclassify from.
+    `error_detail` is the same carry-through for `Classification.detail`
+    (see DESIGN.md) — the specifics (declared vs. actual bytes, the cap
+    that tripped, connect vs. read) live only where they were computed.
     """
 
     outcome: Outcome
     elapsed: float
-    resolved_url: str | None
     response: FetchResponse | None
     error_kind: "ErrorKind | None" = None
+    error_detail: str | None = None

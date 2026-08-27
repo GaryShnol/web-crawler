@@ -23,6 +23,10 @@ One session per step, seeded from `CLAUDE.md` and ending with a
 single briefs, so the decisions show up in the transcripts as positions I argued
 rather than output I accepted.
 
+Before delivery, a separate session with none of the build context was pointed
+at the repo and asked to find reasons to reject it rather than defend it
+(`10-adversarial-review.md`).
+
 ## Notable rejections
 
 1. **`enqueue_many` as a single `WITH` query.** Under Read Committed both
@@ -63,6 +67,58 @@ rather than output I accepted.
    `store/frontier.py` takes a `Connection`; the pool stays at `engine.py` and
    `cli.py`.
 
+8. **A code change for the window between a committed claim and the worker
+   resuming.** Raised in review as a lost lease. Every pairing of a database
+   write with in-process state has that window and `SIGKILL` has it regardless;
+   the lease is what bounds it. What was actually wrong was an `engine.py`
+   docstring promising an unconditional release. The docstring changed, the
+   code didn't.
+
+9. **`error_message` assembled in the persist layer.** Switching on
+   `error_kind` in `worker.py` to rebuild a string the classifier already held
+   adds one special case per kind. An optional `detail` on `Classification`,
+   filled only where the numbers or the caught exception live, leaves all three
+   `mark_failed` call sites identical.
+
+10. **A static check enforcing "every `enqueue_many` runs inside the persist
+    transaction."** That invariant is what makes the drain check race-free
+    without a lock, so it is worth stating — as a sentence where someone would
+    break it, not as lint machinery guarding one call site.
+
+## What the tests didn't catch
+
+Three defects reached the end of the build with the suite green.
+
+`docker-entrypoint.sh` was checked out with CRLF, so Linux looked for an
+interpreter named `/bin/sh\r`; the container exited 255 before any Python ran.
+Drain detection rode lease recovery's 60s interval, so a crawl that finished
+nine urls in two seconds took another sixty to exit — correct, and
+indistinguishable from a hang to anyone watching. Both surfaced the first time
+`docker compose up` was treated as something to run rather than something to
+claim.
+
+The third was structural. `site.build_routes()`'s fixture graph had existed
+since feature 1, referenced by a link-resolution smoke test and by handler unit
+tests calling into it directly — but every end-to-end test in `test_engine.py`
+built its own single-url route dict rather than crawling the graph. A response
+class that has to be *reachable from the seed page* to matter therefore had no
+test that would ever drive it. The test that closed this gap (later renamed
+`test_full_fixture_graph_crawls_clean_then_a_restart_touches_nothing`, once a
+second property landed in it) is the first crawl over the whole graph, and it
+caught `contents.content_type NOT NULL`
+on a header-less body that `sniff` matched anyway — a path no unit test calling
+`insert_content` directly could reach. The remaining gaps (a redirect, the 4xx
+and 5xx routes, a malformed envelope) land the same way: a route, a link from
+the seed page, an assertion in that test.
+
+A different kind of miss surfaced in the closing pass over the delivered
+docs: two decisions written down early — a per-type `index.jsonl`, SVG
+dimensions stored null with a reason — were never built, and stayed
+documented as fact in `CLAUDE.md`, then inherited forward into `DESIGN.md`
+and `README.md` without either ever being checked against the code. Neither
+regressed; both were true the day they were written and false ever after.
+Catching that is what the closing pass is for.
+
 ## Where I was wrong
 
 I challenged the claim that `INSERT ... ON CONFLICT DO NOTHING` raises a
@@ -70,6 +126,29 @@ serialization failure under `REPEATABLE READ`, citing a documentation paraphrase
 saying such an insert simply does not proceed. The position was held rather than
 conceded, the interleaving re-run with exception introspection, and it returned
 SQLSTATE `40001` deterministically. I took the correction.
+
+I also reported the crawler hanging once the frontier drained, and called it the
+most severe finding open: nothing set `stop_claiming` on an empty frontier.
+Reproduction disproved it. `docker compose up --abort-on-container-exit`
+self-terminated at exit 0, and `_supervise` had been setting the event all
+along. The real defect sat next to the one I claimed: drain detection rode lease
+recovery's 60s interval, so a crawl that finished in two seconds took
+sixty-nine to exit. The fix was a second interval, not the mechanism I said was
+missing.
+
+I read the fetch API's closed statusCode set (`200|404|429|403|500`, no 3xx) as
+proof a redirect could only ever surface as a `200` the API had already followed
+on my behalf — the same move `CLAUDE.md` already made for `ETag` against a
+status set with no `304` in it, so I extended it to `Location` too, and built
+`FetchResult.resolved_url` to catch the header off any response on that premise.
+Nothing ever demonstrated a real API 3xx to justify the jump. A later review
+challenged the reading using the same evidence the first pass had: the
+assignment's table was never a promise that 3xx can't arrive, only that it isn't
+documented, and an off-contract status still needs a real classification rather
+than being retried to exhaustion as `UNEXPECTED_STATUS`. That reading won —
+`resolved_url` came out (one write site, no reader, the same shape
+`encode_body`/`decode_body` turned out to be), and `errors.py` gained a
+dedicated `PERMANENT_FAILURE`/`REDIRECT` branch instead.
 
 ## Transcripts
 

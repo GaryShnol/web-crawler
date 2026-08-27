@@ -8,6 +8,7 @@ from crawler.errors import (
     ErrorKind,
     classify,
     classify_exception,
+    classify_malformed_response,
     classify_oversized_body,
     classify_unparseable_content,
 )
@@ -26,6 +27,29 @@ class TestPermanentFailures:
     def test_403_is_permanent_forbidden(self):
         result = classify(_response(403))
         assert result == Classification(Outcome.PERMANENT_FAILURE, ErrorKind.FORBIDDEN)
+
+
+class TestRedirect:
+    # A 3xx is off the documented statusCode set the same way a 418 is (see
+    # TestTemporaryFailures.test_unexpected_status_is_temporary...), but it's
+    # PERMANENT rather than TEMPORARY: it's a deterministic answer about this
+    # url, not this API's ordinary flakiness, so a retry meets the same
+    # redirect every time (see DESIGN.md).
+    def test_302_with_location_is_permanent_redirect(self):
+        result = classify(_response(302, {"Location": "http://fixture.local/final"}))
+        assert result.outcome is Outcome.PERMANENT_FAILURE
+        assert result.error_kind is ErrorKind.REDIRECT
+        assert result.detail == "redirect to http://fixture.local/final"
+
+    def test_location_lookup_is_case_insensitive(self):
+        result = classify(_response(301, {"location": "http://fixture.local/final"}))
+        assert result.detail == "redirect to http://fixture.local/final"
+
+    def test_redirect_with_no_location_is_still_permanent_redirect(self):
+        result = classify(_response(307))
+        assert result.outcome is Outcome.PERMANENT_FAILURE
+        assert result.error_kind is ErrorKind.REDIRECT
+        assert result.detail == "redirect with no Location header"
 
 
 class TestTemporaryFailures:
@@ -69,7 +93,9 @@ class TestSuccess:
 class TestTruncatedBody:
     def test_content_length_mismatch_is_temporary_truncated(self):
         result = classify(_response(200, {"Content-Length": "99999"}, b"short"))
-        assert result == Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.TRUNCATED_BODY)
+        assert result.outcome is Outcome.TEMPORARY_FAILURE
+        assert result.error_kind is ErrorKind.TRUNCATED_BODY
+        assert result.detail == "declared 99999 bytes, got 5"
 
 
 class TestEmptyBodyAndConditionalHit:
@@ -96,43 +122,73 @@ class TestEmptyBodyAndConditionalHit:
 
 class TestBodyTooLarge:
     def test_oversized_body_is_permanent(self):
-        result = classify_oversized_body()
-        assert result == Classification(Outcome.PERMANENT_FAILURE, ErrorKind.BODY_TOO_LARGE)
+        result = classify_oversized_body(max_body_bytes=100, bytes_read=8500)
+        assert result.outcome is Outcome.PERMANENT_FAILURE
+        assert result.error_kind is ErrorKind.BODY_TOO_LARGE
+        assert result.detail == "exceeded max_body_bytes=100 (read at least 8500 bytes)"
+
+
+class TestMalformedResponse:
+    # TEMPORARY like classify_internal_error, but a different kind on
+    # purpose -- INTERNAL_ERROR is reserved for a bug in this codebase, and
+    # a malformed envelope is the remote side, not us.
+    def test_malformed_response_is_temporary_not_internal_error(self):
+        result = classify_malformed_response(ValueError("Expecting value: line 1 column 1"))
+        assert result.outcome is Outcome.TEMPORARY_FAILURE
+        assert result.error_kind is ErrorKind.MALFORMED_RESPONSE
+        assert result.error_kind is not ErrorKind.INTERNAL_ERROR
+        assert "Expecting value" in result.detail
 
 
 class TestUnparseableContent:
     def test_unparseable_content_is_temporary(self):
         # unlike an oversized body, a retry isn't guaranteed to see the same
         # broken bytes — the fetch API can return something different next time.
-        result = classify_unparseable_content()
-        assert result == Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.UNPARSEABLE_CONTENT)
+        result = classify_unparseable_content(ValueError("bad chunk stream"))
+        assert result.outcome is Outcome.TEMPORARY_FAILURE
+        assert result.error_kind is ErrorKind.UNPARSEABLE_CONTENT
+        assert result.detail == "ValueError: bad chunk stream"
 
 
 class TestClassifyException:
     def test_timeout_is_temporary(self):
         result = classify_exception(TimeoutError())
-        assert result == Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.TIMEOUT)
+        assert result.outcome is Outcome.TEMPORARY_FAILURE
+        assert result.error_kind is ErrorKind.TIMEOUT
 
     def test_connection_error_is_temporary(self):
         result = classify_exception(aiohttp.ClientConnectionError())
-        assert result == Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.CONNECTION_ERROR)
+        assert result.outcome is Outcome.TEMPORARY_FAILURE
+        assert result.error_kind is ErrorKind.CONNECTION_ERROR
 
     def test_payload_error_is_temporary_connection_error(self):
         # a body that dies mid-stream is the transport failing, not a status
         # the service returned — grouped with ClientConnectionError.
         result = classify_exception(aiohttp.ClientPayloadError())
-        assert result == Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.CONNECTION_ERROR)
+        assert result.outcome is Outcome.TEMPORARY_FAILURE
+        assert result.error_kind is ErrorKind.CONNECTION_ERROR
 
     def test_connection_error_subclass_is_temporary(self):
         # ClientOSError is what aiohttp actually raises on a reset connection.
         result = classify_exception(aiohttp.ClientOSError())
-        assert result == Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.CONNECTION_ERROR)
+        assert result.outcome is Outcome.TEMPORARY_FAILURE
+        assert result.error_kind is ErrorKind.CONNECTION_ERROR
 
     def test_server_timeout_error_is_timeout_not_connection_error(self):
         # ServerTimeoutError subclasses both TimeoutError and
         # ClientConnectionError — the timeout check must win.
         result = classify_exception(aiohttp.ServerTimeoutError())
-        assert result == Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.TIMEOUT)
+        assert result.outcome is Outcome.TEMPORARY_FAILURE
+        assert result.error_kind is ErrorKind.TIMEOUT
+
+    def test_detail_distinguishes_connect_from_read_timeout(self):
+        # Both subclass ServerTimeoutError/TimeoutError identically for
+        # classification purposes -- detail is the only place connect vs.
+        # read survives, via the exception's own class name.
+        connect = classify_exception(aiohttp.ConnectionTimeoutError())
+        read = classify_exception(aiohttp.SocketTimeoutError())
+        assert "ConnectionTimeoutError" in connect.detail
+        assert "SocketTimeoutError" in read.detail
 
     def test_unrelated_exception_is_reraised_not_swallowed(self):
         with pytest.raises(TypeError):

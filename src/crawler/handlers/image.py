@@ -14,11 +14,12 @@ from .base import Handler, HandlerResult, register
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
-@register("image/png")
+@register
 class ImageHandler(Handler):
     kind = "image"
     directory = "images"
     extension = "png"
+    content_type = "image/png"
 
     def sniff(self, body: bytes) -> bool:
         return body.startswith(_PNG_MAGIC)

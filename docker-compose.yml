@@ -5,6 +5,17 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: crawler
       POSTGRES_DB: crawler
+    ports:
+      # Published so crawl state is inspectable from the host (psql, pgAdmin)
+      # without exec'ing into the container. 55433, not 5432 or 5433, both of
+      # which already had a listener on the machine this was developed on.
+      - "55433:5432"
+    volumes:
+      # Named, not the image's anonymous volume: crawl state has to outlive
+      # `docker compose down`, or a reviewer testing resume by stopping and
+      # restarting the stack gets a crawl from scratch and concludes resume
+      # doesn't work. `make reset` is the deliberate way to wipe it.
+      - crawl-db:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d crawler"]
       interval: 2s
@@ -53,3 +64,4 @@ services:
 
 volumes:
   crawl-output:
+  crawl-db:

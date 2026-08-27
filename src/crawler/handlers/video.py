@@ -69,11 +69,12 @@ def _read_duration_seconds(body: bytes) -> tuple[float | None, str | None]:
         return None, "ffprobe could not determine duration"
 
 
-@register("video/mp4")
+@register
 class VideoHandler(Handler):
     kind = "video"
     directory = "videos"
     extension = "mp4"
+    content_type = "video/mp4"
 
     def sniff(self, body: bytes) -> bool:
         return body[4:8] == _FTYP_MAGIC and body[8:12] in _MP4_BRANDS

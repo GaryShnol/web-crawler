@@ -13,10 +13,18 @@ from contextlib import asynccontextmanager
 import pytest
 from aiohttp.test_utils import TestServer
 from conftest import TEST_DATABASE_URL
+from fake_api import site
 from fake_api.app import FakeResponse, create_app
 
 from crawler.config import Config
-from crawler.engine import _drain, _progress, _supervise, run
+from crawler.engine import (
+    _drain,
+    _force_shutdown_on_death,
+    _progress,
+    _supervise,
+    _watch_drain,
+    run,
+)
 from crawler.fetch.rate_limiter import RateLimiter
 from crawler.store import frontier
 
@@ -47,12 +55,63 @@ async def _running(routes: dict[str, list[FakeResponse]]):
 
 
 class TestSupervise:
-    async def test_stops_claiming_once_the_frontier_drains(self, pool):
+    async def test_recovers_an_expired_lease_along_the_way(self, pool):
+        stop_claiming = asyncio.Event()
+        url_id = await _insert_pending(pool, "http://fixture.local/y")
+        async with pool.acquire() as conn:
+            [claimed] = await frontier.claim_batch(conn, 1, _config())
+        assert claimed.id == url_id
+        await pool.execute(
+            "UPDATE urls SET lease_until = now() - interval '1 second' WHERE id = $1", url_id
+        )
+
+        task = asyncio.create_task(
+            _supervise(pool, stop_claiming, interval=999, sleep=_instant_sleep)
+        )
+        await asyncio.wait_for(_wait_until(lambda: _status(pool, url_id), "pending"), timeout=5)
+        stop_claiming.set()
+        await asyncio.wait_for(task, timeout=5)
+
+    async def test_does_not_stop_claiming_when_the_frontier_drains(self, pool):
+        # Drain detection is _watch_drain's job now, not _supervise's -- see
+        # DESIGN.md on why the two intervals had to split. This guards
+        # against the two silently getting re-coupled.
         stop_claiming = asyncio.Event()
         url_id = await _insert_pending(pool, "http://fixture.local/x")
 
         task = asyncio.create_task(
             _supervise(pool, stop_claiming, interval=999, sleep=_instant_sleep)
+        )
+        await asyncio.sleep(0)  # let the first tick run
+
+        async with pool.acquire() as conn:
+            [claimed] = await frontier.claim_batch(conn, 1, _config())
+            await frontier.mark_done(
+                conn,
+                url_id,
+                claimed.lease_token,
+                content_type=None,
+                content_length=None,
+                content_hash=None,
+                etag=None,
+            )
+        await asyncio.sleep(0)
+
+        assert not stop_claiming.is_set()  # frontier is empty; _supervise doesn't care
+        stop_claiming.set()
+        await asyncio.wait_for(task, timeout=5)
+
+
+class TestWatchDrain:
+    async def test_stops_claiming_once_the_frontier_drains(self, pool):
+        stop_claiming = asyncio.Event()
+        reasons: list[str] = []
+        url_id = await _insert_pending(pool, "http://fixture.local/x")
+
+        task = asyncio.create_task(
+            _watch_drain(
+                pool, stop_claiming, interval=999, record_reason=reasons.append, sleep=_instant_sleep
+            )
         )
         await asyncio.sleep(0)  # let the first tick run
         assert not stop_claiming.is_set()  # one pending row: not complete yet
@@ -71,8 +130,11 @@ class TestSupervise:
 
         await asyncio.wait_for(task, timeout=5)
         assert stop_claiming.is_set()
+        assert reasons == ["drain"]
 
-    async def test_recovers_an_expired_lease_along_the_way(self, pool):
+    async def test_does_not_touch_lease_recovery(self, pool):
+        # _watch_drain only ever reads; recover_expired_leases is
+        # _supervise's job, on its own (longer) interval.
         stop_claiming = asyncio.Event()
         url_id = await _insert_pending(pool, "http://fixture.local/y")
         async with pool.acquire() as conn:
@@ -83,9 +145,13 @@ class TestSupervise:
         )
 
         task = asyncio.create_task(
-            _supervise(pool, stop_claiming, interval=999, sleep=_instant_sleep)
+            _watch_drain(
+                pool, stop_claiming, interval=999, record_reason=lambda _r: None, sleep=_instant_sleep
+            )
         )
-        await asyncio.wait_for(_wait_until(lambda: _status(pool, url_id), "pending"), timeout=5)
+        await asyncio.sleep(0)
+
+        assert await _status(pool, url_id) == "in_progress"  # still leased; nothing recovered it
         stop_claiming.set()
         await asyncio.wait_for(task, timeout=5)
 
@@ -190,6 +256,63 @@ class TestDrain:
         )
         assert task.cancelled()
 
+    async def test_a_task_that_raises_is_reported_and_run_returns_true(self, caplog):
+        # Stands in for worker.run() itself breaking (a claim, a release,
+        # the pool going away) -- process_one already contains an ordinary
+        # per-url bug, so a task reaching gather() with a live exception
+        # means the worker loop broke, not one bad url.
+        caplog.set_level(logging.ERROR, logger="crawler.engine")
+
+        async def boom() -> None:
+            raise ValueError("worker broke")
+
+        task = asyncio.create_task(boom(), name="worker-0")
+        force_stop = asyncio.Event()
+
+        failed = await asyncio.wait_for(
+            _drain([task], force_stop, grace_seconds=999, sleep=_never_sleep), timeout=5
+        )
+
+        assert failed is True
+        assert any("worker-0" in r.getMessage() for r in caplog.records)
+
+
+class TestForceShutdownOnDeath:
+    async def test_a_dying_task_sets_stop_claiming_and_records_why(self, caplog):
+        # The deadlock this exists to prevent: nothing else unblocks
+        # run()'s `await stop_claiming.wait()` if a task normally
+        # responsible for ending the crawl -- the supervisor, or now the
+        # drain watcher -- dies mid-crawl instead of just finishing.
+        caplog.set_level(logging.ERROR, logger="crawler.engine")
+        stop_claiming = asyncio.Event()
+        reasons: list[str] = []
+
+        async def boom() -> None:
+            raise RuntimeError("drain watcher broke")
+
+        task = asyncio.create_task(boom())
+        _force_shutdown_on_death(task, stop_claiming, reasons.append, "drain watcher")
+
+        with pytest.raises(RuntimeError):
+            await asyncio.wait_for(task, timeout=5)
+        await asyncio.sleep(0)  # let the done-callback run
+
+        assert stop_claiming.is_set()
+        assert reasons == ["drain watcher died"]
+        assert any("drain watcher" in r.getMessage() for r in caplog.records)
+
+    async def test_a_clean_completion_does_not_set_stop_claiming(self):
+        stop_claiming = asyncio.Event()
+        reasons: list[str] = []
+        task = asyncio.create_task(_instant_sleep(0))
+        _force_shutdown_on_death(task, stop_claiming, reasons.append, "supervisor")
+
+        await asyncio.wait_for(task, timeout=5)
+        await asyncio.sleep(0)
+
+        assert not stop_claiming.is_set()
+        assert reasons == []
+
 
 class TestRunEndToEnd:
     async def test_a_single_page_with_no_links_crawls_and_exits_cleanly(self, pool, tmp_path):
@@ -211,6 +334,149 @@ class TestRunEndToEnd:
         row = await pool.fetchrow("SELECT status FROM urls WHERE normalized_url = $1", seed)
         assert row["status"] == "done"
 
+    async def test_logs_why_it_stopped_and_the_terminal_counts(self, pool, tmp_path, caplog):
+        caplog.set_level(logging.INFO, logger="crawler.engine")
+        seed = "http://fixture.local/"
+        routes = {
+            seed: [FakeResponse(200, {"Content-Type": "text/html"}, b"<html><body>no links</body></html>")]
+        }
+        async with _running(routes) as server:
+            config = Config(
+                seed_url=seed,
+                database_url=TEST_DATABASE_URL,
+                fetch_api_url=str(server.make_url("/fetch")),
+                output_dir=tmp_path,
+                max_concurrency=1,
+            )
+            await asyncio.wait_for(run(config, sleep=_instant_sleep), timeout=15)
+
+        lines = [r for r in caplog.records if r.getMessage() == "crawl stopped"]
+        assert len(lines) == 1
+        assert lines[0].context["reason"] == "drain"
+        assert lines[0].context["done"] == 1
+        assert lines[0].context["pending"] == 0
+
+    async def test_full_fixture_graph_crawls_clean_then_a_restart_touches_nothing(
+        self, pool, tmp_path, caplog
+    ):
+        """site.py's own graph, actually driven through engine.run() rather
+        than just asserted to exist (test_fake_api.py's job) or fed to a
+        handler directly (test_handlers_*.py's). This is what catches a
+        response the write path can't handle -- MISSING_CONTENT_TYPE's
+        sniff-only match, no Content-Type header at all -- reaching
+        insert_content and hitting contents.content_type NOT NULL, which no
+        unit test calling insert_content directly would ever have driven.
+
+        Second half: what a reviewer actually does with docker-compose.yml's
+        crawl-db volume -- run the stack again against a database that's
+        already fully drained. No test anywhere else covers this; the
+        two-run change-detection table in the README covers the opposite
+        property (every url reset to pending first, forcing a revisit).
+        Runs with the fake_api server already torn down, deliberately: if
+        the second run ever tried to fetch anything at all, it would fail
+        loudly against a dead server rather than silently succeeding against
+        a live one that happens to still be running.
+        """
+        caplog.set_level(logging.INFO, logger="crawler.engine")
+        routes = site.build_routes()
+        async with _running(routes) as server:
+            config = Config(
+                seed_url=site.SEED,
+                database_url=TEST_DATABASE_URL,
+                fetch_api_url=str(server.make_url("/fetch")),
+                output_dir=tmp_path,
+                max_concurrency=4,
+                # Real max_attempts (5), not lowered: STATUS_500 and
+                # MALFORMED_ENVELOPE need to actually reach it. What's
+                # shrunk is the backoff formula's own delay -- retries still
+                # wait on a real clock: next_attempt_at is compared against
+                # Postgres's own now() in claim_batch's WHERE, which the
+                # injected sleep=_instant_sleep below can't speed up (it only
+                # shortens each worker's own idle-poll wait).
+                retry_base_seconds=0.01,
+                retry_max_seconds=0.05,
+            )
+            # STATUS_429_WITH_RETRY_AFTER and STATUS_429_THEN_SUCCESS both
+            # honor a real Retry-After: 1 (RFC 7231's smallest legal value,
+            # not shrinkable via retry_base/max_seconds above), so this
+            # crawl spends a few genuine wall-clock seconds beyond the other
+            # end-to-end tests' budget.
+            exit_code = await asyncio.wait_for(run(config, sleep=_instant_sleep), timeout=30)
+
+        assert exit_code == 0
+
+        row = await pool.fetchrow(
+            "SELECT status, content_type, content_hash FROM urls WHERE normalized_url = $1",
+            site.MISSING_CONTENT_TYPE,
+        )
+        assert row["status"] == "done"
+        assert row["content_type"] is None  # the header that was actually sent: none
+
+        stored_type = await pool.fetchval(
+            "SELECT content_type FROM contents WHERE content_hash = $1", row["content_hash"]
+        )
+        assert stored_type == "image/png"  # ImageHandler's own canonical type, from sniff alone
+
+        # Permanent kinds give up after one attempt; transient kinds are
+        # driven all the way to config.max_attempts before giving up.
+        await _assert_failed(
+            pool,
+            site.REDIRECT,
+            attempts=1,
+            error_kind="redirect",
+            message_contains="http://fixture.local/redirect-target",
+        )
+        await _assert_failed(pool, site.STATUS_404, attempts=1, error_kind="not_found")
+        await _assert_failed(pool, site.STATUS_403, attempts=1, error_kind="forbidden")
+        await _assert_failed(
+            pool, site.STATUS_500, attempts=config.max_attempts, error_kind="server_error"
+        )
+        await _assert_failed(
+            pool,
+            site.STATUS_429_WITH_RETRY_AFTER,
+            attempts=config.max_attempts,
+            error_kind="rate_limited",
+        )
+        await _assert_failed(
+            pool,
+            site.MALFORMED_ENVELOPE,
+            attempts=config.max_attempts,
+            error_kind="malformed_response",
+        )
+
+        # The one route that recovers -- proves the retry policy and the
+        # limiter actually let a transient failure succeed, not just fail
+        # predictably.
+        recovered = await pool.fetchrow(
+            "SELECT status, attempts FROM urls WHERE normalized_url = $1", site.STATUS_429_THEN_SUCCESS
+        )
+        assert recovered["status"] == "done"
+        assert recovered["attempts"] == 3
+
+        # Restart: same config, same database, frontier already fully
+        # drained. caplog.clear() so the "crawl stopped" line asserted below
+        # is this run's own, not run 1's leftover record.
+        before = await _snapshot(pool)
+        files_before = _all_files(tmp_path)
+        caplog.clear()
+        second_exit_code = await asyncio.wait_for(run(config, sleep=_instant_sleep), timeout=10)
+
+        assert second_exit_code == 0  # worthless alone -- exit 0 doesn't say nothing ran
+
+        lines = [r for r in caplog.records if r.getMessage() == "crawl stopped"]
+        assert len(lines) == 1
+        assert lines[0].context["reason"] == "drain"  # recognized on sight, not by falling through
+
+        after = await _snapshot(pool)
+        assert after == before  # the assertion that actually carries this test:
+        # attempts unchanged means nothing was reclaimed; content_hash
+        # unchanged means nothing was re-fetched; last_seen_at unchanged is
+        # the sharpest of the three -- it only ever moves inside mark_done/
+        # mark_unchanged, so if it didn't move, no url was claimed at all,
+        # not even into a same-hash no-op write.
+
+        assert _all_files(tmp_path) == files_before  # zero blob writes, not just zero new ones
+
     async def test_a_missing_seed_url_is_rejected_before_touching_the_pool(self):
         config = Config(database_url=TEST_DATABASE_URL, fetch_api_url="http://unused/unused")
         with pytest.raises(ValueError, match="seed_url"):
@@ -223,6 +489,37 @@ def _config() -> Config:
         database_url="postgresql://unused/unused",
         fetch_api_url="http://unused/unused",
     )
+
+
+async def _snapshot(pool) -> dict[str, tuple]:
+    """Local, not shared with test_resumability.py's near-identical
+    _final_state -- four lines duplicated across two files is cheaper than a
+    conftest export coupling both to one shape neither otherwise needs.
+    """
+    rows = await pool.fetch(
+        "SELECT normalized_url, status, attempts, content_hash, last_seen_at FROM urls"
+    )
+    return {
+        r["normalized_url"]: (r["status"], r["attempts"], r["content_hash"], r["last_seen_at"])
+        for r in rows
+    }
+
+
+def _all_files(root) -> set:
+    return {p for p in root.rglob("*") if p.is_file()}
+
+
+async def _assert_failed(
+    pool, url: str, *, attempts: int, error_kind: str, message_contains: str | None = None
+) -> None:
+    row = await pool.fetchrow(
+        "SELECT status, attempts, error_kind, error_message FROM urls WHERE normalized_url = $1", url
+    )
+    assert row["status"] == "failed"
+    assert row["attempts"] == attempts
+    assert row["error_kind"] == error_kind
+    if message_contains is not None:
+        assert message_contains in row["error_message"]
 
 
 async def _status(pool, url_id: int) -> str:
