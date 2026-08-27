@@ -2,7 +2,7 @@
 registry and its `@register` decorator. A handler module that isn't
 imported here never registers itself, and silently matches nothing; this
 is the one place a fifth handler's file has to be named, alongside its new
-file and its one `@register(...)` decorator.
+file and its own bare `@register`.
 """
 
 from . import html as _html  # noqa: F401 — imported for its @register side effect

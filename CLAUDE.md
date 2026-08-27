@@ -106,17 +106,6 @@ and its findings are being worked through.
   indistinguishable from a hang to anyone watching it. Neither of the two
   suspects previously recorded here, pool exhaustion and rate-limiter
   starvation, was involved in either.
-- **There is no `README.md`.** Content already staged to land in it, not
-  stand alone: the two-run change-detection table below; a "what I'd do
-  differently" entry for lease renewal / a heartbeat — see DESIGN.md's "No
-  lease renewal: can't tell slow from dead," found while writing
-  `test_resumability.py`, not designed for, and deliberately not built; and,
-  beside the "Postgres holds the frontier" decision below, the empirical
-  case for it — `test_resumability.py`'s run produced a real
-  `"mark_done: lease race lost, no row updated"` line during a genuine live
-  double-claim (the same gap above), and the crawl stayed correct anyway.
-  At-most-once holding under an actual race, observed rather than argued —
-  worth more to a reviewer than the paragraph defending it.
 - **`handlers/html.py` still doesn't honour `<base href>`.** Resolution
   always uses the page's own url.
 - **`handlers/image.py` only registers PNG.** Sniffed by real PNG magic
@@ -139,7 +128,14 @@ actually let a transient failure succeed and not just fail predictably).
 `STATUS_429_WITHOUT_RETRY_AFTER` stays unlinked — that distinction is
 already covered by the rate limiter's own unit tests.
 
-Next, in order: a `README.md`, then the worklog and delivery.
+`README.md` is written — key decisions, trade-offs, production-scale notes,
+and what I'd do differently, including the lease-renewal gap and the
+two-run change-detection table (recaptured under a real `docker compose up`
+this time; the version this file used to point to was a local `uv run`
+that routed around the compose hang, back when compose was broken, and
+those numbers never belonged in a delivered README). `DESIGN.md` is
+trimmed to what a reviewer needs to disagree with each decision, not the
+full argument. Next: the worklog and delivery.
 
 ### Merged and working
 
