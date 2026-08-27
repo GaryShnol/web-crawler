@@ -86,7 +86,10 @@ A module gets created when it has work to do, not before.
 
 Features 1-4 are merged into `main`. `feature/5-hardening` is committed but
 not merged: change detection (5.2), observability (5.3), docker-compose and
-the Makefile (5.4). 5.1 — the SIGKILL resumability test — was never written.
+the Makefile (5.4). 5.1 — the SIGKILL resumability test — is written now,
+on `feature/6-delivery`: `tests/test_resumability.py`, the one test in the
+suite that runs the crawler as a real OS subprocess rather than in-process
+asyncio, because SIGKILL only means anything against a real process.
 `feature/6-delivery` is the current branch: the adversarial review has run
 and its findings are being worked through.
 
@@ -103,8 +106,17 @@ and its findings are being worked through.
   indistinguishable from a hang to anyone watching it. Neither of the two
   suspects previously recorded here, pool exhaustion and rate-limiter
   starvation, was involved in either.
-- **There is no `README.md`.** The two-run change-detection table below is
-  meant to land in it, not stand alone.
+- **There is no `README.md`.** Content already staged to land in it, not
+  stand alone: the two-run change-detection table below; a "what I'd do
+  differently" entry for lease renewal / a heartbeat — see DESIGN.md's "No
+  lease renewal: can't tell slow from dead," found while writing
+  `test_resumability.py`, not designed for, and deliberately not built; and,
+  beside the "Postgres holds the frontier" decision below, the empirical
+  case for it — `test_resumability.py`'s run produced a real
+  `"mark_done: lease race lost, no row updated"` line during a genuine live
+  double-claim (the same gap above), and the crawl stayed correct anyway.
+  At-most-once holding under an actual race, observed rather than argued —
+  worth more to a reviewer than the paragraph defending it.
 - **`handlers/html.py` still doesn't honour `<base href>`.** Resolution
   always uses the page's own url.
 - **`handlers/image.py` only registers PNG.** Sniffed by real PNG magic
@@ -254,7 +266,18 @@ engine.py    run(config, sleep=asyncio.sleep) -> int — bounded pool, lease
              change it. Logs one "crawl stopped" line with the reason
              (drain / signal / a dead support task) and terminal counts
 cli.py       `crawl <seed>` and `stats [--since <iso8601>]` (text report)
-tests/       fake_api/ test double + test_* for everything above
+tests/       fake_api/ test double + test_* for everything above.
+             test_resumability.py is the exception: spawns the crawler via
+             `sys.executable -m crawler.cli crawl <seed>` (PYTHONPATH set by
+             hand -- crawler isn't installed, pytest's own `pythonpath` ini
+             option is the only reason imports work everywhere else),
+             SIGKILLs it mid-crawl (proc.kill(), verified empirically to run
+             no Python in the child on this platform -- no skipif needed),
+             restarts against the same DB, and asserts nothing lost, nothing
+             done re-fetched, and whatever was genuinely still in flight
+             costs exactly one extra claim. Never blocks on Popen.wait() --
+             that freezes this process's own event loop, which is what's
+             serving the fake API the subprocess talks to.
 ```
 
 `attempts` is incremented only by `claim_batch`'s own statement — not by

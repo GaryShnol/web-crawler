@@ -133,6 +133,32 @@ an ordered index scan on its own (e.g. the planner switching strategies at
 a different table size) — that's the thing actually being relied on here,
 not the absence of an `OR` for its own sake.
 
+## No lease renewal: can't tell slow from dead
+
+`lease_seconds` bounds how long a crashed worker's claim stays uncontested.
+It does not, and cannot, distinguish a crashed worker from a genuinely slow
+one, because nothing here lets a worker that's still alive prove it — there's
+no heartbeat, no renewal, just a fixed deadline set once at claim time. A
+fetch that legitimately runs past `lease_seconds` gets its row reclaimed by
+`recover_expired_leases` exactly the way a dead worker's would, and a second
+worker claims the same row under a fresh `lease_token` while the first is
+still actively working it. `lease_token` fencing (`store/frontier.py`'s
+`mark_done`/`mark_failed`) keeps the *outcome* correct — the original
+worker's write loses the race, is dropped, and is logged (`"lease race lost,
+no row updated"`), never silently overwriting the second worker's result —
+but the fetch itself ran twice, and one of the two results is thrown away
+for nothing.
+
+Found empirically, not reasoned out: `tests/test_resumability.py` needed
+`LEASE_SECONDS=6` in its config, not `2`, specifically because a live worker
+under real concurrent load (8 workers, a real subprocess, one single-threaded
+fake server) occasionally took longer than 2 seconds to finish a fetch that
+never failed — and a false "expired" lease looks identical to a real one from
+`recover_expired_leases`'s side, because nothing tells them apart. Not fixed
+here — a heartbeat or periodic lease renewal is what closes this, and it's
+recorded as a known gap rather than built; see the README's "what I'd do
+differently."
+
 ## enqueue_many: two statements, not one CTE
 
 Chose `INSERT ... ON CONFLICT DO NOTHING`, then a separate `SELECT` (plus
