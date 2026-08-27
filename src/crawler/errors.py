@@ -30,6 +30,7 @@ class ErrorKind(enum.Enum):
     TIMEOUT = "timeout"
     CONNECTION_ERROR = "connection_error"
     UNPARSEABLE_CONTENT = "unparseable_content"
+    MALFORMED_RESPONSE = "malformed_response"
     INTERNAL_ERROR = "internal_error"
 
 
@@ -117,6 +118,23 @@ def classify_unparseable_content(exc: Exception) -> Classification:
     to meet the same size.
     """
     return Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.UNPARSEABLE_CONTENT, _describe(exc))
+
+
+def classify_malformed_response(exc: Exception) -> Classification:
+    """The one shape a fetch API envelope that isn't well-formed can take:
+    invalid JSON, a missing `statusCode`, or a `body` that isn't valid
+    base64 — three exceptions, one fact (this call produced garbage), so
+    one kind covers all three; nothing downstream tells them apart anyway.
+
+    TEMPORARY, same as classify_internal_error, but a different kind on
+    purpose: INTERNAL_ERROR exists to separate "this codebase has a bug"
+    from "the remote side is unreliable" (see DESIGN.md), and a malformed
+    envelope is squarely the second one. Filing it as INTERNAL_ERROR would
+    make that split lie — fetch/client.py classifies it here, at the fetch
+    layer, before process_one's outer `except` (the real backstop, for an
+    actual bug) ever gets a chance to see it.
+    """
+    return Classification(Outcome.TEMPORARY_FAILURE, ErrorKind.MALFORMED_RESPONSE, _describe(exc))
 
 
 def classify_internal_error(exc: Exception) -> Classification:

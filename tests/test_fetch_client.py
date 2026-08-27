@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
-from fake_api.app import FakeResponse, create_app
+from fake_api.app import FakeResponse, MalformedResponse, create_app
 
 from crawler.config import Config
 from crawler.fetch.client import FetchClient
@@ -112,6 +112,20 @@ class TestSuccessAndClassification:
 
         assert first.response.body == b"one"
         assert second.response.body == b"two"
+
+
+class TestMalformedEnvelope:
+    async def test_invalid_json_is_temporary_malformed_response(self):
+        routes = {"u": [MalformedResponse(b"{not json")]}
+        async with (
+            _running(create_app(routes)) as server,
+            FetchClient(_config(str(server.make_url("/fetch")))) as client,
+        ):
+            result = await client.fetch("u")
+
+        assert result.outcome == Outcome.TEMPORARY_FAILURE
+        assert result.response is None  # nothing parsed far enough to build one
+        assert result.error_detail is not None
 
 
 class TestConditionalRequest:

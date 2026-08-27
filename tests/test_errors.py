@@ -8,6 +8,7 @@ from crawler.errors import (
     ErrorKind,
     classify,
     classify_exception,
+    classify_malformed_response,
     classify_oversized_body,
     classify_unparseable_content,
 )
@@ -125,6 +126,18 @@ class TestBodyTooLarge:
         assert result.outcome is Outcome.PERMANENT_FAILURE
         assert result.error_kind is ErrorKind.BODY_TOO_LARGE
         assert result.detail == "exceeded max_body_bytes=100 (read at least 8500 bytes)"
+
+
+class TestMalformedResponse:
+    # TEMPORARY like classify_internal_error, but a different kind on
+    # purpose -- INTERNAL_ERROR is reserved for a bug in this codebase, and
+    # a malformed envelope is the remote side, not us.
+    def test_malformed_response_is_temporary_not_internal_error(self):
+        result = classify_malformed_response(ValueError("Expecting value: line 1 column 1"))
+        assert result.outcome is Outcome.TEMPORARY_FAILURE
+        assert result.error_kind is ErrorKind.MALFORMED_RESPONSE
+        assert result.error_kind is not ErrorKind.INTERNAL_ERROR
+        assert "Expecting value" in result.detail
 
 
 class TestUnparseableContent:

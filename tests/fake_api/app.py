@@ -4,7 +4,9 @@ service, see CLAUDE.md. GET /fetch?url=<encoded> returns a JSON envelope
 fetch/client.py decodes with directly — see DESIGN.md for why it's an
 assumption). A route is a response *sequence*: call N for a URL
 returns routes[url][min(N, len-1)], so the last entry sticks once exhausted.
-Fresh app per test — no reset endpoint.
+A `MalformedResponse` entry skips the envelope shape entirely -- for the one
+fixture that has to not be well-formed JSON at all. Fresh app per test — no
+reset endpoint.
 
 Fault injection is env-driven and seeded, so a run is reproducible:
 FAKE_API_SEED (default 0), FAKE_API_FAULT_RATE (default 0, 0..1 chance per
@@ -36,6 +38,16 @@ class FakeResponse(NamedTuple):
     body: bytes | None
 
 
+class MalformedResponse(NamedTuple):
+    """A route entry that isn't a well-formed envelope at all -- raw_body
+    goes straight onto the wire, bypassing _envelope() and its statusCode/
+    headers/body shape. Exists to drive fetch/client.py's own envelope
+    parsing, not routes.get's usual FakeResponse shape.
+    """
+
+    raw_body: bytes
+
+
 def _fault_response(kind: str, rng: random.Random) -> FakeResponse | None:
     if kind == "429_retry_after":
         return FakeResponse(429, {"Retry-After": str(rng.randint(1, 5))}, None)
@@ -54,7 +66,8 @@ def _envelope(resp: FakeResponse) -> dict:
 
 
 def create_app(
-    routes: dict[str, list[FakeResponse]], capture: list[dict[str, str]] | None = None
+    routes: dict[str, list[FakeResponse | MalformedResponse]],
+    capture: list[dict[str, str]] | None = None,
 ) -> web.Application:
     rng = random.Random(int(os.environ.get("FAKE_API_SEED", "0")))
     fault_rate = float(os.environ.get("FAKE_API_FAULT_RATE", "0"))
@@ -79,7 +92,10 @@ def create_app(
         sequence = routes.get(url, [FakeResponse(404, {}, None)])
         n = calls.get(url, 0)
         calls[url] = n + 1
-        return web.json_response(_envelope(sequence[min(n, len(sequence) - 1)]))
+        entry = sequence[min(n, len(sequence) - 1)]
+        if isinstance(entry, MalformedResponse):
+            return web.Response(body=entry.raw_body, content_type="application/json")
+        return web.json_response(_envelope(entry))
 
     async def healthz(_request: web.Request) -> web.Response:
         return web.Response(text="ok")

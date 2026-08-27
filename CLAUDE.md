@@ -103,16 +103,6 @@ and its findings are being worked through.
   indistinguishable from a hang to anyone watching it. Neither of the two
   suspects previously recorded here, pool exhaustion and rate-limiter
   starvation, was involved in either.
-- **`tests/fake_api/` only generates responses the code handles well.**
-  Nothing reachable from the seed page returns 404, 403, 429, 500, or a
-  malformed envelope, so no crawl has ever traversed those failures end to
-  end. Every missing fixture sits on the far side of an `except` clause or a
-  status branch nothing has driven. (A missing `Content-Type` and a 3xx
-  redirect are covered now — `site.py`'s `MISSING_CONTENT_TYPE` and
-  `REDIRECT`, both driven end to end by `test_engine.py`'s
-  `test_full_fixture_graph_crawls_clean`, which is also the first test to
-  run `engine.run()` over `site.build_routes()`'s whole graph at all rather
-  than an ad-hoc single-URL route dict.)
 - **There is no `README.md`.** The two-run change-detection table below is
   meant to land in it, not stand alone.
 - **`handlers/html.py` still doesn't honour `<base href>`.** Resolution
@@ -122,9 +112,22 @@ and its findings are being worked through.
   one more `@register`'d file, same shape as this one, whenever something
   actually needs it. The fixture site only ever serves PNG.
 
-All three adversarial-review findings are closed. Next, in order: the
-fake_api gaps above (404/403/429/500, malformed envelope), then a
-`README.md`, then the worklog and delivery.
+All three adversarial-review findings are closed, and `tests/fake_api/` no
+longer only generates responses the code handles well: every fixture below
+is reachable from the seed page and driven end to end by `test_engine.py`'s
+`test_full_fixture_graph_crawls_clean` — the first test to run `engine.run()`
+over `site.build_routes()`'s whole graph at all, rather than an ad-hoc
+single-URL route dict. `MISSING_CONTENT_TYPE` (no `Content-Type` header),
+`REDIRECT` (a 3xx with `Location`), `STATUS_404`/`STATUS_403` (permanent,
+one attempt), `STATUS_500`/`STATUS_429_WITH_RETRY_AFTER` (transient, driven
+to `max_attempts`), `MALFORMED_ENVELOPE` (not valid JSON — see
+`errors.py`'s `classify_malformed_response`), and `STATUS_429_THEN_SUCCESS`
+(the one route that recovers, proving the retry policy and the limiter
+actually let a transient failure succeed and not just fail predictably).
+`STATUS_429_WITHOUT_RETRY_AFTER` stays unlinked — that distinction is
+already covered by the rate limiter's own unit tests.
+
+Next, in order: a `README.md`, then the worklog and delivery.
 
 ### Merged and working
 
@@ -133,17 +136,22 @@ models.py    Outcome, FetchResponse(status_code, headers, body),
              FetchResult(outcome, elapsed, response,
                          error_kind=None, error_detail=None),
              find_header, parse_retry_after
-errors.py    ErrorKind (incl. internal_error, redirect), Classification(outcome,
-             error_kind, detail=None), classify(response, prev_etag=None),
+errors.py    ErrorKind (incl. internal_error, redirect, malformed_response),
+             Classification(outcome, error_kind, detail=None),
+             classify(response, prev_etag=None),
              classify_oversized_body(max_body_bytes, bytes_read),
              classify_unparseable_content(exc), classify_internal_error(exc),
-             classify_exception(exc)
+             classify_malformed_response(exc), classify_exception(exc)
              detail is set only where a classifier holds real numbers or a
              caught exception; nothing downstream rebuilds it. classify()
              treats any 3xx as PERMANENT_FAILURE/REDIRECT, Location folded
              into detail — see DESIGN.md's redirect decision for why 3xx
              doesn't get the same benefit-of-the-doubt as other off-contract
-             statuses (still TEMPORARY_FAILURE/UNEXPECTED_STATUS)
+             statuses (still TEMPORARY_FAILURE/UNEXPECTED_STATUS).
+             classify_malformed_response is fetch/client.py's own — invalid
+             JSON, a missing statusCode, or bad base64, all TEMPORARY and
+             deliberately not INTERNAL_ERROR: that kind means a bug in this
+             codebase, and a malformed envelope is the remote side instead
 url_tools.py normalize(url, base=None), in_scope(url, seed_host, allow_subdomains)
 config.py    Config (pydantic-settings) — seed_url is optional; only
              engine.run() requires it, so `stats` needs no placeholder

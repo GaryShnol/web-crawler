@@ -14,7 +14,12 @@ from typing import Self
 import aiohttp
 
 from ..config import Config
-from ..errors import classify, classify_exception, classify_oversized_body
+from ..errors import (
+    classify,
+    classify_exception,
+    classify_malformed_response,
+    classify_oversized_body,
+)
 from ..models import FetchResponse, FetchResult
 
 _BASE64_GROUP = 4  # base64 emits 4 output bytes per 3 input bytes
@@ -111,16 +116,33 @@ class FetchClient:
 
         elapsed = time.monotonic() - started
 
-        envelope = json.loads(raw)
-        encoded_body = envelope.get("body")
-        # Assumed wire encoding for a `Buffer | null` body -- the real API's
-        # own encoding is unverifiable (see DESIGN.md), so this is a guess:
-        # base64, or null.
-        body = base64.b64decode(encoded_body) if encoded_body is not None else None
+        try:
+            envelope = json.loads(raw)
+            encoded_body = envelope.get("body")
+            # Assumed wire encoding for a `Buffer | null` body -- the real
+            # API's own encoding is unverifiable (see DESIGN.md), so this is
+            # a guess: base64, or null.
+            body = base64.b64decode(encoded_body) if encoded_body is not None else None
+            response = FetchResponse(
+                status_code=envelope["statusCode"], headers=envelope.get("headers") or {}, body=body
+            )
+        except (ValueError, KeyError, TypeError) as exc:
+            # ValueError covers invalid JSON (json.JSONDecodeError) and bad
+            # base64 padding (binascii.Error); KeyError is a missing
+            # statusCode; TypeError is a body that decoded but isn't a
+            # str/bytes base64 can work with. All three are the service
+            # returning garbage, not a bug here -- classified at this layer,
+            # before process_one's outer `except` (the real backstop for an
+            # actual bug) ever sees it. See classify_malformed_response.
+            classification = classify_malformed_response(exc)
+            return FetchResult(
+                outcome=classification.outcome,
+                elapsed=elapsed,
+                response=None,
+                error_kind=classification.error_kind,
+                error_detail=classification.detail,
+            )
 
-        response = FetchResponse(
-            status_code=envelope["statusCode"], headers=envelope.get("headers") or {}, body=body
-        )
         classification = classify(response, prev_etag)
 
         return FetchResult(

@@ -373,8 +373,22 @@ class TestRunEndToEnd:
                 fetch_api_url=str(server.make_url("/fetch")),
                 output_dir=tmp_path,
                 max_concurrency=4,
+                # Real max_attempts (5), not lowered: STATUS_500 and
+                # MALFORMED_ENVELOPE need to actually reach it. What's
+                # shrunk is the backoff formula's own delay -- retries still
+                # wait on a real clock: next_attempt_at is compared against
+                # Postgres's own now() in claim_batch's WHERE, which the
+                # injected sleep=_instant_sleep below can't speed up (it only
+                # shortens each worker's own idle-poll wait).
+                retry_base_seconds=0.01,
+                retry_max_seconds=0.05,
             )
-            exit_code = await asyncio.wait_for(run(config, sleep=_instant_sleep), timeout=15)
+            # STATUS_429_WITH_RETRY_AFTER and STATUS_429_THEN_SUCCESS both
+            # honor a real Retry-After: 1 (RFC 7231's smallest legal value,
+            # not shrinkable via retry_base/max_seconds above), so this
+            # crawl spends a few genuine wall-clock seconds beyond the other
+            # end-to-end tests' budget.
+            exit_code = await asyncio.wait_for(run(config, sleep=_instant_sleep), timeout=30)
 
         assert exit_code == 0
 
@@ -390,14 +404,41 @@ class TestRunEndToEnd:
         )
         assert stored_type == "image/png"  # ImageHandler's own canonical type, from sniff alone
 
-        redirect_row = await pool.fetchrow(
-            "SELECT status, attempts, error_kind, error_message FROM urls WHERE normalized_url = $1",
+        # Permanent kinds give up after one attempt; transient kinds are
+        # driven all the way to config.max_attempts before giving up.
+        await _assert_failed(
+            pool,
             site.REDIRECT,
+            attempts=1,
+            error_kind="redirect",
+            message_contains="http://fixture.local/redirect-target",
         )
-        assert redirect_row["status"] == "failed"
-        assert redirect_row["attempts"] == 1  # PERMANENT: gives up without touching max_attempts
-        assert redirect_row["error_kind"] == "redirect"
-        assert "http://fixture.local/redirect-target" in redirect_row["error_message"]
+        await _assert_failed(pool, site.STATUS_404, attempts=1, error_kind="not_found")
+        await _assert_failed(pool, site.STATUS_403, attempts=1, error_kind="forbidden")
+        await _assert_failed(
+            pool, site.STATUS_500, attempts=config.max_attempts, error_kind="server_error"
+        )
+        await _assert_failed(
+            pool,
+            site.STATUS_429_WITH_RETRY_AFTER,
+            attempts=config.max_attempts,
+            error_kind="rate_limited",
+        )
+        await _assert_failed(
+            pool,
+            site.MALFORMED_ENVELOPE,
+            attempts=config.max_attempts,
+            error_kind="malformed_response",
+        )
+
+        # The one route that recovers -- proves the retry policy and the
+        # limiter actually let a transient failure succeed, not just fail
+        # predictably.
+        recovered = await pool.fetchrow(
+            "SELECT status, attempts FROM urls WHERE normalized_url = $1", site.STATUS_429_THEN_SUCCESS
+        )
+        assert recovered["status"] == "done"
+        assert recovered["attempts"] == 3
 
     async def test_a_missing_seed_url_is_rejected_before_touching_the_pool(self):
         config = Config(database_url=TEST_DATABASE_URL, fetch_api_url="http://unused/unused")
@@ -411,6 +452,19 @@ def _config() -> Config:
         database_url="postgresql://unused/unused",
         fetch_api_url="http://unused/unused",
     )
+
+
+async def _assert_failed(
+    pool, url: str, *, attempts: int, error_kind: str, message_contains: str | None = None
+) -> None:
+    row = await pool.fetchrow(
+        "SELECT status, attempts, error_kind, error_message FROM urls WHERE normalized_url = $1", url
+    )
+    assert row["status"] == "failed"
+    assert row["attempts"] == attempts
+    assert row["error_kind"] == error_kind
+    if message_contains is not None:
+        assert message_contains in row["error_message"]
 
 
 async def _status(pool, url_id: int) -> str:
