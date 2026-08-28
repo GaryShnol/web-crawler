@@ -450,8 +450,18 @@ to write runs past ~120 lines, stop and tell me what you'd cut — and if I keep
 it anyway, that's not the rule failing, it's the rule doing its job: `store/`
 modules that are genuinely several single-statement atomic operations (raw SQL,
 no ORM) run bigger than that once docstrings are trimmed to a DESIGN.md
-pointer each; `frontier.py` is 412 lines across eleven such functions. Say the
-real number and let me decide, rather than reformatting to dodge the count.
+pointer each; `frontier.py` is 412 lines across eleven such functions.
+`engine.py` (306 lines) and `worker.py` (275) are the same story in a
+different shape: `engine.py` is the whole process's coordinating surface —
+claim pool, lease supervisor, drain watcher, progress task, signal
+handling, graceful shutdown, each its own small function carrying a
+why-heavy docstring — and `worker.py` is one worker's whole lifecycle, one
+function per terminal outcome (success, failure, internal error) plus the
+claim loop around them. Splitting either across files would cut the line
+count and cost the thing that actually matters: every path a url can end
+on, or every task the engine coordinates, staying visible in one place.
+Say the real number and let me decide, rather than reformatting to dodge
+the count.
 No TODOs, no stub functions, and nothing in the test suite is allowed to
 actually sleep — inject the clock.
 
