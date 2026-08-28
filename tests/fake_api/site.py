@@ -3,7 +3,7 @@ build_routes() feeds app.create_app(); the constants are what tests assert on.
 """
 
 from .app import FakeResponse, MalformedResponse
-from .payloads import tiny_pdf, tiny_png, tiny_video_no_duration
+from .payloads import tiny_gif, tiny_jpeg, tiny_pdf, tiny_png, tiny_video_no_duration
 
 SEED = "http://fixture.local/"
 QUERY_ONLY = "http://fixture.local/page?token=abc123"
@@ -26,6 +26,8 @@ STATUS_429_THEN_SUCCESS = "http://fixture.local/limited-then-ok"
 MALFORMED_ENVELOPE = "http://fixture.local/malformed"
 
 IMAGE = "http://fixture.local/hero.png"
+JPEG_IMAGE = "http://fixture.local/hero.jpg"
+GIF_IMAGE = "http://fixture.local/hero.gif"
 PDF = "http://fixture.local/doc.pdf"
 VIDEO = "http://fixture.local/clip.mp4"
 
@@ -48,6 +50,8 @@ def build_routes() -> dict[str, list[FakeResponse | MalformedResponse]]:
         f'<a href="{OFFDOMAIN_PAGE}">offdomain</a>'
         f'<img src="{OFFHOST_IMAGE}">'
         f'<a href="{IMAGE}">image</a>'
+        f'<a href="{JPEG_IMAGE}">jpeg image</a>'
+        f'<a href="{GIF_IMAGE}">gif image</a>'
         f'<a href="{PDF}">pdf</a>'
         f'<a href="{VIDEO}">video</a>'
         f'<a href="{DRIFTING}">drifting</a>'
@@ -93,6 +97,8 @@ def build_routes() -> dict[str, list[FakeResponse | MalformedResponse]]:
             _html("<html><body>ok on the third attempt</body></html>"),
         ],
         IMAGE: [FakeResponse(200, {"Content-Type": "image/png"}, tiny_png())],
+        JPEG_IMAGE: [FakeResponse(200, {"Content-Type": "image/jpeg"}, tiny_jpeg())],
+        GIF_IMAGE: [FakeResponse(200, {"Content-Type": "image/gif"}, tiny_gif())],
         # No Content-Type at all -- resolve() still has to route this by
         # sniff alone, and the real bug this drives is downstream of
         # routing: contents.content_type must never end up storing this

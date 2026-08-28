@@ -12,6 +12,24 @@ def tiny_png() -> bytes:
     return buf.getvalue()
 
 
+def tiny_jpeg() -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (2, 3), color=(30, 200, 30)).save(buf, format="JPEG")
+    return buf.getvalue()
+
+
+def tiny_gif() -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (3, 4), color=(30, 30, 200)).save(buf, format="GIF")
+    return buf.getvalue()
+
+
+def tiny_webp() -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (4, 5), color=(200, 200, 30)).save(buf, format="WEBP")
+    return buf.getvalue()
+
+
 def tiny_pdf() -> bytes:
     writer = PdfWriter()
     writer.add_blank_page(width=72, height=72)
