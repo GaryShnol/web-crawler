@@ -195,3 +195,30 @@ classifier already had for free, growing by one special case per kind.
 through the same way `error_kind` already does — the one thing a caller
 recording a failure can't safely re-derive once the response is gone.
 Kinds with nothing to add leave `detail` `None`.
+
+## Change detection: content hash on revisit, not a conditional request
+
+The API's status set has no `304`, so a conditional request can't save
+bandwidth here — the body comes back in full regardless, and the only
+honest comparison is of the bytes themselves. `ETag` is stored and sent as
+`If-None-Match` anyway: checking costs nothing, and a service that does
+honour it would otherwise be ignored for free.
+
+Measured across two consecutive `docker compose` crawls of the same fixture
+graph. The crawler has no re-crawl timer, so run 2 was forced by hand,
+resetting every url's `status` to `pending` between runs:
+
+| metric | run 1 (fresh) | run 2 (revisit) |
+|---|---|---|
+| done / failed | 11 / 6 | 11 / 6 |
+| attempts (retried) | 31 (14) | 48 (31) |
+| bytes: text/html | 1,143 | 1,190 |
+| dedup | 9 distinct / 11 stored (18.2%) | 9 distinct / 11 stored (18.2%) |
+| content changed | 0 | 1 — `/drifting` |
+
+The reset didn't zero `attempts` — it's the same counter carrying forward,
+not two independent crawls — so run 2's total includes the four
+intentionally-flaky fixture routes picking up their retry budgets where run
+1 left them, not thrash from the revisit itself. Only the url whose body
+actually differed registers a change; everything else's hash matches and
+only `last_seen_at` moves.
