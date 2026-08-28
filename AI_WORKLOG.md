@@ -9,12 +9,14 @@ transcript records the version: `v2.1.245` for the two design sessions,
 
 ## Models, by stage
 
-| Stage | Sessions | Model |
-|---|---|---|
-| Planning / design | `01-decisions`, `1.2-decisions` | Claude Sonnet 5 |
-| Scaffolding | `02-scaffolding` | Claude Sonnet 5 |
-| Implementation | `03-errors` through `09-content-handlers-and-asset-discovery` | Claude Sonnet 5 |
-| Review / refactor | `10-adversarial-review`, `11-review-fixes-and-delivery-path`, `12-close-leftover` | Claude Sonnet 5 |
+| Stage | Sessions | Model | Accepted / rejected |
+|---|---|---|---|
+| Planning / design | `01-decisions`, `1.2-decisions` | Claude Sonnet 5 | accepted, with two overreaches caught and corrected — see "What I rejected" |
+| Scaffolding | `02-scaffolding` | Claude Sonnet 5 | accepted |
+| Implementation | `03-errors` through `09-content-handlers-and-asset-discovery` | Claude Sonnet 5 | accepted, with several proposals rejected along the way — see "What I rejected" |
+| Review / refactor | `10-adversarial-review`, `11-review-fixes-and-delivery-path`, `12-close-leftover` | Claude Sonnet 5 | accepted, with two of my own findings disproven under reproduction — see "Where I was wrong" |
+| Second review, pre-submission | `13-pre-submission-review` | Claude Sonnet 5 | audit and critique accepted; the fix work it started before I'd asked for fixes was rejected and reverted |
+| Fix pass | `14-review-fixes` | Claude Sonnet 5 | accepted, plus one override of the review's own recommendation — see "Where I overrode the review" |
 
 The choice was not deliberate. Sonnet 5 is the model my Claude Pro plan gives
 me, so there was nothing to choose between at any stage. With a second model
@@ -97,6 +99,37 @@ what neither of us caught until something actually ran.
     without a lock, so it's worth stating — as a sentence where someone would
     break it, not as lint machinery guarding a single call site.
 
+11. **C5 — a lease heartbeat.** The pre-submission review named this the
+    sharpest interview question the codebase invites, and I still didn't fix
+    it. Fencing already keeps the *outcome* correct under a reclaimed lease —
+    a stale write loses the race, never overwrites — so a heartbeat is a real
+    architectural addition (a cooperative renewal task per claim), not a bug
+    fix, and I'd rather build that deliberately than bolt it on under a
+    review's momentum. The cost stays stated plainly in README.md and
+    DESIGN.md instead of being rushed into the fix pass. (`14-review-fixes`)
+
+12. **C6 — following redirects.** The documented status set has no 3xx row
+    in it at all; making one followable reshapes `FetchResult`/
+    `Classification`/the frontier write path more than any other fix in that
+    pass. DESIGN.md now concedes the real cost — a site that redirects for
+    anything routine can't be crawled to completion — right next to the
+    argument for the choice, rather than the argument standing alone
+    unchallenged. (`14-review-fixes`)
+
+## Where I overrode the review
+
+`CODE_REVIEW.md` itself recommended deferring C3 — `engine.py` reaching
+into `worker.py`'s private `_wait` across a module boundary — as cosmetic,
+low-risk, a follow-up rather than something the fix pass needed to touch. I
+fixed it anyway, moving it into a shared `asyncio_util.py` as a public name
+(`14-review-fixes`). A leading-underscore import across a module boundary
+is exactly what a separation-of-concerns criterion looks at, and the fix
+was one new file and two import lines — cheap enough that "defer it" read
+as the review being conservative about its own scope, not a real argument
+that it shouldn't happen. Reviewer judgment isn't automatically mine to
+inherit, even when the reviewer and the fixer are the same tool one session
+apart.
+
 ## Where I was wrong
 
 I argued that `INSERT ... ON CONFLICT DO NOTHING` doesn't raise a
@@ -130,7 +163,7 @@ branch.
 
 ## What the tests didn't catch
 
-Three defects reached the end of the build with the suite green.
+Five defects reached the end of the build with the suite green.
 
 `docker-entrypoint.sh` was checked out with CRLF, so Linux looked for an
 interpreter named `/bin/sh\r` and the container exited 255 before any Python
@@ -156,6 +189,18 @@ a reason — were never built, but stayed in `CLAUDE.md` as fact and were
 inherited forward into `DESIGN.md` and `README.md` without either being
 checked against the code. Nothing regressed; the docs simply described a
 system that didn't exist. That pass is what it's for.
+
+A fifth is the same failure running backwards, and it happened twice in the
+same pass. `CLAUDE.md` claimed `frontier.py` was 237 lines when it was
+actually 412 — caught only because a review went looking for it (C8,
+`13-pre-submission-review`). One commit later, `CLAUDE.md`'s own "what is
+actually missing" list still said images were PNG-only and `<base href>`
+wasn't honoured, a full commit *after* both were fixed (`c06425d`,
+`c8d42b2`). The fourth case above was docs written ahead of code that never
+got built; this one is code that moved and a hand-written file that didn't
+move with it. Same root cause either direction: nothing re-reads `CLAUDE.md`
+against the tree, so it stays accurate exactly as long as I remember to
+check it by hand, and twice in one delivery pass I didn't.
 
 ## Transcripts
 
