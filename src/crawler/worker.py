@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 
 import asyncpg
 
+from .asyncio_util import wait
 from .config import Config
 from .errors import ErrorKind, classify_internal_error, classify_unparseable_content
 from .fetch.client import FetchClient
@@ -228,23 +229,6 @@ async def process_one(
         logger.info("url completed", extra={"context": context})
 
 
-async def _wait(event: asyncio.Event, timeout: float, sleep: Callable[[float], Awaitable[None]]) -> None:
-    """Waits for `event`, or `timeout` seconds via `sleep`, whichever comes
-    first. A cancellable, clock-injectable stand-in for
-    `asyncio.wait_for(event.wait(), timeout)`, which is bound to the real
-    event loop clock and so can't be sped up in a test — see
-    fetch/rate_limiter.py's `now`/`sleep` for the same reasoning.
-    """
-    event_wait = asyncio.ensure_future(event.wait())
-    timer = asyncio.ensure_future(sleep(timeout))
-    try:
-        await asyncio.wait({event_wait, timer}, return_when=asyncio.FIRST_COMPLETED)
-    finally:
-        for future in (event_wait, timer):
-            if not future.done():
-                future.cancel()
-
-
 async def run(
     worker_id: int,
     pool: asyncpg.Pool,
@@ -272,7 +256,7 @@ async def run(
                 claimed = await frontier.claim_batch(conn, 1, config)
 
             if not claimed:
-                await _wait(stop_claiming, config.poll_interval_seconds, sleep)
+                await wait(stop_claiming, config.poll_interval_seconds, sleep)
                 continue
 
             [claimed_url] = claimed
