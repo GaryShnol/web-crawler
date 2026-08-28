@@ -12,6 +12,30 @@ failed: 6, skipped: 0`, ~14s), and this pass touches no source file, so that
 result still stands. No code changed in this stage; this document is the
 audit and critique only, feeding a separate FIX pass.
 
+## Status
+
+Fixed, one commit each:
+
+| Finding | Fix | Commit |
+|---|---|---|
+| C1 — images PNG-only | JPEG/GIF/WEBP handlers, sharing `_raster.raster_metadata` | `c06425d` |
+| C2 — `<base href>` not honoured | resolved against it when present, page url otherwise | `c8d42b2` |
+| C4 — completion log overstated enqueued links at `max_depth` | `links` now the enqueued count; `links_deferred` added | `27201bf` |
+| C7 — `resolve()`'s dispatch had no direct test | `tests/test_handlers_base.py` | `0b53293` |
+| C8 — `CLAUDE.md`'s `frontier.py` line count was stale | corrected, and the sweep it prompted | `3b6b9a4`, `0d87b89`, `735e135` |
+| C3 — `engine.py` imported `worker.py`'s private `_wait` | moved to a shared, public `asyncio_util.wait` | `2b3b4dc` |
+
+Refused on purpose, not fixed:
+
+- **C5 — no lease renewal.** Fencing already keeps the *outcome* correct
+  under a reclaimed lease; adding a heartbeat is a real architectural
+  addition (a cooperative renewal task per claim), not a bug fix. Stays
+  documented in README.md/DESIGN.md as what's left to do.
+- **C6 — redirects not followed.** The documented status set has no 3xx
+  row in it; following one reshapes `FetchResult`/`Classification`/the
+  frontier write path more than any fix in this pass. DESIGN.md now
+  states the cost plainly alongside the argument for the choice.
+
 ---
 
 ## 1. Traceability audit
