@@ -71,9 +71,11 @@ an implementation of the service.
 
 ```
 src/crawler/  models.py errors.py config.py logging.py url_tools.py
+              asyncio_util.py
               fetch/    client.py rate_limiter.py retry.py
               store/    db.py frontier.py blobs.py metadata.py
-              handlers/ base.py html.py image.py pdf.py video.py
+              handlers/ base.py html.py image.py jpeg.py gif.py webp.py
+                        _raster.py pdf.py video.py
               worker.py engine.py cli.py
 tests/        fake_api/  test_*.py
 migrations/   001_init.sql
@@ -106,12 +108,15 @@ and its findings are being worked through.
   indistinguishable from a hang to anyone watching it. Neither of the two
   suspects previously recorded here, pool exhaustion and rate-limiter
   starvation, was involved in either.
-- **`handlers/html.py` still doesn't honour `<base href>`.** Resolution
-  always uses the page's own url.
-- **`handlers/image.py` only registers PNG.** Sniffed by real PNG magic
-  bytes, not by asking Pillow to open anything — a second raster format is
-  one more `@register`'d file, same shape as this one, whenever something
-  actually needs it. The fixture site only ever serves PNG.
+- **Redirects aren't followed.** Any `3xx` is `PERMANENT_FAILURE`, `Location`
+  recorded but never fetched — a deliberate reading of a status table with
+  no 3xx row in it (DESIGN.md), not an oversight. The cost is real: a site
+  that redirects for anything routine can't be crawled to completion.
+- **No lease heartbeat.** A live worker can't renew its lease, so
+  `lease_seconds` can't distinguish a slow worker from a dead one — fencing
+  keeps the *outcome* correct (a stale write loses the race, never
+  overwrites), but a legitimately slow fetch gets reclaimed and refetched
+  for nothing. See README's "what I'd do differently".
 
 All three adversarial-review findings are closed, and `tests/fake_api/` no
 longer only generates responses the code handles well: every fixture below
@@ -169,6 +174,13 @@ url_tools.py normalize(url, base=None), in_scope(url, seed_host, allow_subdomain
 config.py    Config (pydantic-settings) — seed_url is optional; only
              engine.run() requires it, so `stats` needs no placeholder
 logging.py   json to stdout, bindable context, level from config.log_level
+asyncio_util.py
+             wait(event, timeout, sleep) — waits for event or timeout,
+             whichever first; cancellable, clock-injectable stand-in for
+             asyncio.wait_for(event.wait(), timeout). Shared by worker.py's
+             poll loop and engine.py's _supervise/_watch_drain/_progress —
+             promoted out of worker.py so engine.py wasn't importing a
+             leading-underscore name across a module boundary
 
 fetch/       FetchClient(config) async CM, fetch(url, prev_etag=None) -> FetchResult
              RateLimiter(config, now=monotonic, sleep=asyncio.sleep)
@@ -239,11 +251,24 @@ handlers/base.py
              resolve(content_type, body) -> Handler | None
 handlers/html.py   HtmlHandler "text/html" — kind "page", dir "pages", ext "html"
                    links: a[href] (is_asset=False) plus img/video/source/embed
-                   src (is_asset=True); metadata {title, link_count} over all
-                   of them combined. No <base href> support.
+                   src (is_asset=True), resolved against <base href> when the
+                   page declares one (itself resolved against the page's own
+                   url first) and the page's own url otherwise; metadata
+                   {title, link_count} over all of them combined.
+handlers/_raster.py
+                   raster_metadata(body) -> {width, height, file_size} via
+                   Pillow — shared by every raster image handler below so a
+                   new one is a sniff plus this call, not a second Image.open.
 handlers/image.py  ImageHandler "image/png" — kind "image", dir "images", ext "png"
-                   sniffed by the PNG magic bytes; metadata {width, height,
-                   file_size} via Pillow. PNG only — see "what's missing".
+                   sniffed by the PNG magic bytes.
+handlers/jpeg.py   JpegHandler "image/jpeg" — ext "jpg", sniffed by the SOI
+                   marker (\xff\xd8\xff). Same shape as image.py.
+handlers/gif.py    GifHandler "image/gif" — ext "gif", sniffed by the
+                   GIF87a/GIF89a header. Same shape as image.py.
+handlers/webp.py   WebpHandler "image/webp" — ext "webp", sniffed by the RIFF
+                   container's WEBP fourCC at offset 8 (RIFF alone is shared
+                   with AVI/WAV, so the fourCC is what actually identifies
+                   this). Same shape as image.py.
 handlers/pdf.py    PdfHandler "application/pdf" — kind "pdf", dir "pdfs", ext "pdf"
                    sniffed by the %PDF- header; metadata {page_count, title}
                    via pypdf (title is null when the PDF sets none).
@@ -257,9 +282,14 @@ handlers/video.py  VideoHandler "video/mp4" — kind "video", dir "videos", ext 
 
 worker.py    process_one(...) — one structured "url completed" log line per
              url, carrying outcome (done/skipped/unchanged/retrying/failed)
-             plus kind/links/hash_changed or error_kind. An uncaught bug is
-             contained here: logged, then written as a retryable
-             internal_error, rather than killing the worker silently
+             plus kind/links/hash_changed or error_kind. `links` is the
+             enqueued count, gated on within_depth same as the enqueue
+             itself; a url at max_depth reports links=0 and, if anything
+             was discovered but deferred, a links_deferred count alongside
+             it — never links carrying a count nothing was enqueued for.
+             An uncaught bug is contained here: logged, then written as a
+             retryable internal_error, rather than killing the worker
+             silently
 engine.py    run(config, sleep=asyncio.sleep) -> int — bounded pool, lease
              supervisor, drain watcher, progress task, graceful shutdown.
              Returns 1 if a worker or a support task died with a real
@@ -420,8 +450,18 @@ to write runs past ~120 lines, stop and tell me what you'd cut — and if I keep
 it anyway, that's not the rule failing, it's the rule doing its job: `store/`
 modules that are genuinely several single-statement atomic operations (raw SQL,
 no ORM) run bigger than that once docstrings are trimmed to a DESIGN.md
-pointer each; `frontier.py` is 237 lines across six such functions. Say the
-real number and let me decide, rather than reformatting to dodge the count.
+pointer each; `frontier.py` is 412 lines across eleven such functions.
+`engine.py` (306 lines) and `worker.py` (275) are the same story in a
+different shape: `engine.py` is the whole process's coordinating surface —
+claim pool, lease supervisor, drain watcher, progress task, signal
+handling, graceful shutdown, each its own small function carrying a
+why-heavy docstring — and `worker.py` is one worker's whole lifecycle, one
+function per terminal outcome (success, failure, internal error) plus the
+claim loop around them. Splitting either across files would cut the line
+count and cost the thing that actually matters: every path a url can end
+on, or every task the engine coordinates, staying visible in one place.
+Say the real number and let me decide, rather than reformatting to dodge
+the count.
 No TODOs, no stub functions, and nothing in the test suite is allowed to
 actually sleep — inject the clock.
 

@@ -417,6 +417,18 @@ class TestRunEndToEnd:
         )
         assert stored_type == "image/png"  # ImageHandler's own canonical type, from sniff alone
 
+        # A second and third raster handler, reachable end to end -- proof
+        # the registry actually extends to more than one image format.
+        for url, expected_type in ((site.JPEG_IMAGE, "image/jpeg"), (site.GIF_IMAGE, "image/gif")):
+            asset_row = await pool.fetchrow(
+                "SELECT status, content_hash FROM urls WHERE normalized_url = $1", url
+            )
+            assert asset_row["status"] == "done"
+            asset_stored_type = await pool.fetchval(
+                "SELECT content_type FROM contents WHERE content_hash = $1", asset_row["content_hash"]
+            )
+            assert asset_stored_type == expected_type
+
         # Permanent kinds give up after one attempt; transient kinds are
         # driven all the way to config.max_attempts before giving up.
         await _assert_failed(

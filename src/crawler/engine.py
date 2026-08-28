@@ -26,12 +26,12 @@ from urllib.parse import urlsplit
 import asyncpg
 
 from . import worker
+from .asyncio_util import wait
 from .config import Config
 from .fetch.client import FetchClient
 from .fetch.rate_limiter import RateLimiter
 from .store import db, frontier
 from .url_tools import normalize
-from .worker import _wait
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +63,7 @@ async def _supervise(
             recovered = await frontier.recover_expired_leases(conn)
             if recovered:
                 logger.info(f"recovered {recovered} expired lease(s)")
-        await _wait(stop_claiming, interval, sleep)
+        await wait(stop_claiming, interval, sleep)
 
 
 async def _watch_drain(
@@ -85,7 +85,7 @@ async def _watch_drain(
                 record_reason("drain")
                 stop_claiming.set()
                 return
-        await _wait(stop_claiming, interval, sleep)
+        await wait(stop_claiming, interval, sleep)
 
 
 async def _progress(
@@ -109,7 +109,7 @@ async def _progress(
         rate = f"{measured:.1f}/s (limit {rate_limiter.current_rate:.1f}/s)"
         stats = {s: counts.get(s, 0) for s in ("pending", "in_progress", "done", "failed")}
         logger.info("progress", extra={"context": {**stats, "rate": rate}})
-        await _wait(stop_claiming, interval, sleep)
+        await wait(stop_claiming, interval, sleep)
 
 
 async def _drain(

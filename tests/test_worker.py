@@ -6,6 +6,7 @@ the frontier, not what a mock was told to return.
 """
 
 import json
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -134,6 +135,19 @@ class TestSuccessHtml:
 
         child = await pool.fetchrow("SELECT 1 FROM urls WHERE normalized_url = $1", child_link)
         assert child is None
+
+    async def test_max_depth_reports_zero_links_enqueued_not_links_discovered(self, pool, tmp_path, caplog):
+        caplog.set_level(logging.INFO, logger="crawler.worker")
+        page = "http://fixture.local/deep2"
+        child_link = "http://fixture.local/too-deep2"
+        body = f'<html><body><a href="{child_link}">c</a></body></html>'.encode()
+        routes = {page: [FakeResponse(200, {"Content-Type": "text/html"}, body)]}
+
+        await _process(pool, page, routes, tmp_path, depth=0, max_depth=0)
+
+        [line] = [r for r in caplog.records if r.getMessage() == "url completed"]
+        assert line.context["links"] == 0  # nothing was actually enqueued
+        assert line.context["links_deferred"] == 1  # but it wasn't silently lost either
 
     async def test_lying_content_type_is_routed_by_body_not_header(self, pool, tmp_path):
         page = "http://fixture.local/lying"

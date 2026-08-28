@@ -62,15 +62,36 @@ class TestHandle:
         body = b'<html><body><a name="top">no href</a></body></html>'
         assert HANDLER.handle(body, "http://fixture.local/").links == []
 
-    def test_relative_link_resolved_against_the_page_url_not_a_base_tag(self):
-        # <base href> support is a later step — resolution always uses the
-        # page's own url, even when a <base> tag is present.
+    def test_relative_link_resolved_against_the_page_url_when_no_base_tag(self):
+        body = b'<a href="child">c</a>'
+        [link] = HANDLER.handle(body, "http://fixture.local/dir/page").links
+        assert link.normalized_url == "http://fixture.local/dir/child"
+
+    def test_relative_link_resolved_against_an_absolute_base_href(self):
         body = (
-            b'<base href="http://other.local/">'
+            b'<base href="http://other.local/assets/">'
             b'<a href="child">c</a>'
         )
         [link] = HANDLER.handle(body, "http://fixture.local/dir/page").links
-        assert link.normalized_url == "http://fixture.local/dir/child"
+        assert link.normalized_url == "http://other.local/assets/child"
+
+    def test_relative_base_href_is_itself_resolved_against_the_page_url(self):
+        body = b'<base href="assets/"><a href="child">c</a>'
+        [link] = HANDLER.handle(body, "http://fixture.local/dir/page").links
+        assert link.normalized_url == "http://fixture.local/dir/assets/child"
+
+    def test_absolute_link_ignores_base_href(self):
+        body = (
+            b'<base href="http://other.local/">'
+            b'<a href="http://fixture.local/elsewhere">c</a>'
+        )
+        [link] = HANDLER.handle(body, "http://fixture.local/dir/page").links
+        assert link.normalized_url == "http://fixture.local/elsewhere"
+
+    def test_asset_src_also_resolves_against_base_href(self):
+        body = b'<base href="http://cdn.local/assets/"><img src="logo.png">'
+        [link] = HANDLER.handle(body, "http://fixture.local/dir/page").links
+        assert link.normalized_url == "http://cdn.local/assets/logo.png"
 
     def test_fragment_only_href_resolves_to_the_page_without_the_fragment(self):
         body = b'<a href="#section">jump</a>'

@@ -76,8 +76,12 @@ fetch gets reclaimed. Fencing keeps the outcome correct, but the fetch runs
 twice. Found empirically: the SIGKILL resumability test needed a lease six times
 longer than crash recovery alone would justify.
 
-**`<base href>` and a second raster format** — one function, and a file plus its
-`@register`. Deferred because the fixture didn't need them.
+**Redirects aren't followed.** Any `3xx` comes back `PERMANENT_FAILURE`,
+`Location` recorded but never fetched — a deliberate reading of a status
+table with no 3xx row in it, not an oversight (DESIGN.md). The cost is real:
+a site that redirects for anything routine — trailing-slash normalization,
+HTTP→HTTPS, a moved page — can't be crawled to completion, since every URL
+behind a redirect just fails instead of resolving.
 
 Full decision log and measurements: `DESIGN.md`. AI development record:
 `AI_WORKLOG.md` and `ai-transcripts/`.

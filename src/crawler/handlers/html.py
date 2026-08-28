@@ -1,10 +1,10 @@
-"""HTML: title, outbound links, and asset urls, resolved against the page's
-own url. `a[href]` links to the next page, in- or out-of-scope alike --
-worker.py decides which get enqueued. `img[src]`, `video[src]`, `source[src]`
-and `embed[src]` are leaves -- a direct download regardless of host
-(CLAUDE.md's off-host-assets decision) -- so they carry `is_asset=True` for
-worker.py to bypass the scope check on. `<base href>` still isn't honoured;
-resolution always uses the page's own url.
+"""HTML: title, outbound links, and asset urls, resolved against `<base
+href>` when the page declares one, the page's own url otherwise. `a[href]`
+links to the next page, in- or out-of-scope alike -- worker.py decides
+which get enqueued. `img[src]`, `video[src]`, `source[src]` and
+`embed[src]` are leaves -- a direct download regardless of host (CLAUDE.md's
+off-host-assets decision) -- so they carry `is_asset=True` for worker.py to
+bypass the scope check on.
 """
 
 from selectolax.parser import HTMLParser
@@ -43,6 +43,10 @@ class HtmlHandler(Handler):
     def handle(self, body: bytes, url: str) -> HandlerResult:
         tree = HTMLParser(body)
 
+        base_node = tree.css_first("base[href]")
+        base_href = (base_node.attributes.get("href") or "").strip() if base_node is not None else ""
+        base = normalize(base_href, base=url) if base_href else url
+
         links: list[DiscoveredLink] = []
         for node in tree.css("a[href]"):
             href = (node.attributes.get("href") or "").strip()
@@ -51,7 +55,7 @@ class HtmlHandler(Handler):
             anchor_text = node.text(deep=True).strip() or None
             links.append(
                 DiscoveredLink(
-                    raw_url=href, normalized_url=normalize(href, base=url), anchor_text=anchor_text
+                    raw_url=href, normalized_url=normalize(href, base=base), anchor_text=anchor_text
                 )
             )
         for node in tree.css(_ASSET_SELECTOR):
@@ -61,7 +65,7 @@ class HtmlHandler(Handler):
             links.append(
                 DiscoveredLink(
                     raw_url=src,
-                    normalized_url=normalize(src, base=url),
+                    normalized_url=normalize(src, base=base),
                     anchor_text=None,
                     is_asset=True,
                 )
