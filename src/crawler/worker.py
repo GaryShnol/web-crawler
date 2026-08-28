@@ -135,8 +135,14 @@ async def _persist_success(
     context: dict[str, object] = {
         "outcome": "done",
         "kind": handler.kind,
-        "links": len(enqueueable_links),
+        # The enqueued count, not the discovered one -- enqueue_many above
+        # only runs when within_depth, so reporting len(enqueueable_links)
+        # unconditionally would claim links were queued at max_depth when
+        # zero rows actually were (CODE_REVIEW.md C4).
+        "links": len(enqueueable_links) if within_depth else 0,
     }
+    if not within_depth and enqueueable_links:
+        context["links_deferred"] = len(enqueueable_links)
     if previous_hash is not None:  # only a revisit has a hash to compare against
         context["hash_changed"] = previous_hash != content_hash
     return context
