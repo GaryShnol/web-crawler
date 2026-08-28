@@ -66,6 +66,12 @@ answer about *this* url, so retrying it meets the identical redirect every
 time — that asymmetry is why it alone gets `PERMANENT`. Would reconsider
 if the real API ever demonstrably sent one.
 
+The cost of this choice is real, not hypothetical: a site that redirects
+for anything routine — trailing-slash normalization, HTTP→HTTPS, a moved
+page — can't be crawled to completion, because every url behind a redirect
+just fails instead of resolving to what it points at. The argument above
+says why that's the chosen trade-off, not that the trade-off is free.
+
 ## Assumption: body crosses the wire as base64
 
 Chose base64 text (or `null`) for how a `Buffer | null` body crosses the
