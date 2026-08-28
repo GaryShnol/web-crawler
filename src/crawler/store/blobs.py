@@ -27,7 +27,15 @@ def write(output_dir: Path, directory: str, extension: str, url: str, body: byte
     database.
 
     Idempotent: identical bytes for a different url land on the same path,
-    a no-op if it's already there rather than a second write.
+    a no-op if it's already there rather than a second write. That check is
+    the path existing, not the hash matching what's on disk: two *different*
+    bodies sharing both the 12-hex prefix and the url slug would collide on
+    one path, and the second body is silently never written while its row
+    still records the full, un-truncated content_hash as if it were. Accepted
+    at this scale -- 48 bits of hash plus a real url slug narrowing the space
+    further makes a genuine collision astronomically unlikely long before
+    disk layout is the bottleneck; widening the prefix is the fix if that
+    ever stops being true.
     """
     content_hash = hashlib.sha256(body).hexdigest()
     target_dir = output_dir / directory
