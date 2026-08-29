@@ -4,6 +4,26 @@ Given a seed URL, discovers and downloads a site's HTML, images, video and
 PDFs through the fetch API, staying within the seed's host, surviving fetch
 failures and a crash mid-crawl, and resuming where it left off.
 
+## Architecture
+
+The crawler pulls URLs from a Postgres-backed frontier, fetches each one
+through an external API, sniffs and stores what comes back, and feeds any
+links it finds back into the frontier.
+
+```mermaid
+flowchart LR
+    F["Frontier (Postgres)"]
+    W["Worker"]
+    A["Fetch API"]
+    H["Handler"]
+    S["Storage"]
+
+    F --> W --> A --> H --> S
+    H -->|"new links"| F
+```
+
+For the detailed component breakdown see [docs/architecture.md](./docs/architecture.md).
+
 ## Running it
 
 ```
